@@ -44,6 +44,7 @@ from gflow_cli.cli_instructions import instructions as _instructions_group
 from gflow_cli.cli_media import media as _media_group
 from gflow_cli.cli_models import models as _models_command
 from gflow_cli.cli_movie import movie as _movie_group
+from gflow_cli.cli_music import music as _music_group
 from gflow_cli.cli_project import project as _project_group
 from gflow_cli.cli_qa import qa as _qa_group
 from gflow_cli.cli_run import run as _run_command
@@ -744,6 +745,7 @@ main.add_command(_tools_group)
 main.add_command(_daemon_group)
 main.add_command(_workspace_group)
 main.add_command(_qa_group)
+main.add_command(_music_group)
 
 
 # --- mcp --------------------------------------------------------------------
