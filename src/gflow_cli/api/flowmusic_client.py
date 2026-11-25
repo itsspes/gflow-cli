@@ -19,7 +19,7 @@ from typing import Any, Self, cast
 from urllib.parse import urlparse
 
 import structlog
-from playwright.async_api import BrowserContext, Page, Response, async_playwright
+from playwright.async_api import BrowserContext, Page, Request, Response, async_playwright
 
 from gflow_cli.api._engine import (
     CONTEXT_TEARDOWN_TIMEOUT_S,
@@ -52,6 +52,7 @@ log = structlog.get_logger(__name__)
 
 FLOWMUSIC_URL = "https://www.flowmusic.app/"
 FLOWMUSIC_SESSION_URL = "https://www.flowmusic.app/session?t=true"
+FLOWMUSIC_LIBRARY_URL = "https://www.flowmusic.app/library"
 FLOWMUSIC_CLIP_STORAGE_BASE = "https://storage.googleapis.com/producer-app-public/clips"
 _FLOWMUSIC_HOSTS = frozenset({"www.flowmusic.app", "flowmusic.app"})
 
@@ -230,6 +231,9 @@ class FlowMusicClient:
         self._observed_urls: list[dict[str, str]] = []
         self._captured_audio: list[CapturedAudioPayload] = []
         self._pending_tasks: set[asyncio.Task[None]] = set()
+        self._listeners_attached: bool = False
+        # In-memory only: never logged, never persisted, cleared in _teardown().
+        self._session_auth_header: str | None = None
 
     @property
     def page(self) -> Page:
@@ -305,6 +309,8 @@ class FlowMusicClient:
             )
             self._pw = None
         self._page = None
+        self._listeners_attached = False
+        self._session_auth_header = None
         if self._lease is not None:
             self._lease.release()
             self._lease = None
@@ -342,16 +348,34 @@ class FlowMusicClient:
                         CapturedAudioPayload(data=body, ext=ext, url=url, method="network_response")
                     )
 
+        def _on_request(req: Request) -> None:
+            if "/__api/" in urlparse(req.url).path:
+                auth_hdr = req.headers.get("authorization")
+                if auth_hdr:
+                    self._session_auth_header = auth_hdr
+
         def _on_response(resp: Response) -> None:
             task = asyncio.create_task(_capture(resp))
             self._pending_tasks.add(task)
             task.add_done_callback(self._pending_tasks.discard)
 
+        page.on("request", _on_request)
         page.on("response", _on_response)
+        self._listeners_attached = True
 
     async def _goto_settled(self, url: str, *, settle_ms: int = 2_000) -> None:
         await self.page.goto(url, wait_until="domcontentloaded", timeout=45_000)
         await self.page.wait_for_timeout(settle_ms)
+
+    async def _wait_for_api_cache(self, path: str, *, timeout_s: float = 3.0) -> Any:
+        if not self._listeners_attached:
+            return self._api_cache.get(path)
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            if path in self._api_cache or self._session_auth_header is not None:
+                return self._api_cache.get(path)
+            await asyncio.sleep(0.15)
+        return self._api_cache.get(path)
 
     async def _in_page_get_json(self, api_path: str) -> Any:
         """Fetch an ``/__api/*`` endpoint from the browser context, falling back to cache."""
@@ -359,15 +383,32 @@ class FlowMusicClient:
         cached = self._api_cache.get(parsed_path)
         if cached is not None:
             return cached
+        if self._session_auth_header is None and self._listeners_attached:
+            cached = await self._wait_for_api_cache(parsed_path, timeout_s=1.5)
+            if cached is not None:
+                return cached
         try:
-            result: Any = await self.page.evaluate(
-                """async (u) => {
-                  const r = await fetch(u, { credentials: 'include' });
-                  if (!r.ok) return null;
-                  return await r.json();
-                }""",
-                api_path,
-            )
+            if self._session_auth_header is not None:
+                result: Any = await self.page.evaluate(
+                    """async ([u, auth]) => {
+                      const r = await fetch(u, {
+                        credentials: 'include',
+                        headers: { Authorization: auth },
+                      });
+                      if (!r.ok) return null;
+                      return await r.json();
+                    }""",
+                    [api_path, self._session_auth_header],
+                )
+            else:
+                result = await self.page.evaluate(
+                    """async (u) => {
+                      const r = await fetch(u, { credentials: 'include' });
+                      if (!r.ok) return null;
+                      return await r.json();
+                    }""",
+                    api_path,
+                )
             if result is not None:
                 redacted = _redact_payload(result)
                 self._api_cache[parsed_path] = redacted
@@ -483,12 +524,14 @@ class FlowMusicClient:
     async def list_models(self) -> list[FlowMusicModel]:
         """Return available Flow Music models from ``/__api/models``."""
         await self.ensure_authenticated(url=FLOWMUSIC_SESSION_URL)
+        await self._wait_for_api_cache("/__api/models", timeout_s=3.0)
         raw = await self._in_page_get_json("/__api/models")
         return [FlowMusicModel.from_api(item) for item in _extract_items_list(raw, ("models",))]
 
     async def list_clips(self, *, limit: int = 20, offset: int = 0) -> list[FlowMusicClip]:
         """Return generated clips from ``/__api/clips/auth-user``."""
-        await self.ensure_authenticated(url=FLOWMUSIC_URL)
+        await self.ensure_authenticated(url=FLOWMUSIC_LIBRARY_URL)
+        await self._wait_for_api_cache("/__api/clips/auth-user", timeout_s=3.0)
         api_url = (
             f"/__api/clips/auth-user?limit={limit}&offset={offset}"
             "&filter=generations&include_disliked=false"
@@ -577,6 +620,7 @@ class FlowMusicClient:
         """Poll ``/__api/clips/auth-user`` + passive audio capture for a new generated clip."""
         deadline = time.monotonic() + timeout_seconds
         seen_srcs: set[str] = set()
+        first_seen_at: dict[str, float] = {}
         pref = preferred_format.lstrip(".").lower()
         while time.monotonic() < deadline:
             # 1. Check cached/fresh /__api/clips/auth-user for a new clip with audio URL.
@@ -584,9 +628,20 @@ class FlowMusicClient:
             raw = await self._in_page_get_json(
                 "/__api/clips/auth-user?limit=10&offset=0&filter=generations&include_disliked=false"
             )
+            now = time.monotonic()
             for item in _extract_items_list(raw, ("clips",)):
                 clip = FlowMusicClip.from_api(item)
                 if clip.id and clip.id not in existing_ids:
+                    first_seen_at.setdefault(clip.id, now)
+                    # When WAV is requested, wait up to 15s for wav_url to finish rendering
+                    # before falling back to audio_url (.m4a).
+                    if (
+                        pref == "wav"
+                        and not clip.wav_url
+                        and clip.audio_url
+                        and (now - first_seen_at[clip.id]) < 15.0
+                    ):
+                        continue
                     dl_url, ext = clip.preferred_download_url(pref)
                     if dl_url:
                         body, ctype = await self._fetch_bytes(dl_url)
