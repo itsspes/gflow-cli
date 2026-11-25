@@ -35,6 +35,7 @@ from gflow_cli.services.flowmusic import (
     list_flowmusic_videos,
     login_flowmusic,
     probe_flowmusic_ui,
+    rename_flowmusic_session,
 )
 
 console = Console()
@@ -179,6 +180,19 @@ def music_models(profile: str | None, as_json: bool, output_format: str = "table
 @click.option("--instrumental", is_flag=True, default=False, help="Enable instrumental-only mode.")
 @click.option("--advanced-sound", is_flag=True, default=False, help="Enable advanced sound mode.")
 @click.option("--model", default=None, help="Model name (e.g. 'Lyria 3.5').")
+@click.option("--bpm", type=click.IntRange(40, 240), default=None, help="Target tempo in BPM.")
+@click.option(
+    "--length",
+    default=None,
+    help="Target track length in seconds (e.g. 90) or M:SS (clamped to FlowMusic min 1:00).",
+)
+@click.option("--seed", default=None, help="Optional numeric/string generation seed.")
+@click.option("--title", default=None, help="Native song title (defaults to '<slug> <shot>').")
+@click.option(
+    "--session-title",
+    default=None,
+    help="Flow Music session title (defaults to workspace slug when --project-dir is set).",
+)
 @click.option("--out-file", type=click.Path(dir_okay=False, path_type=Path), default=None)
 @click.option("--project-dir", type=click.Path(file_okay=False, path_type=Path), default=None)
 @click.option("--shot", default="s01", show_default=True)
@@ -201,6 +215,11 @@ def music_compose(
     instrumental: bool,
     advanced_sound: bool,
     model: str | None,
+    bpm: int | None,
+    length: str | None,
+    seed: str | None,
+    title: str | None,
+    session_title: str | None,
     out_file: Path | None,
     project_dir: Path | None,
     shot: str,
@@ -224,6 +243,11 @@ def music_compose(
             instrumental=instrumental,
             advanced_sound=advanced_sound,
             model=model,
+            bpm=bpm,
+            length=length,
+            seed=seed,
+            title=title,
+            session_title=session_title,
             out_file=out_file,
             project_dir=project_dir,
             shot=shot,
@@ -249,6 +273,7 @@ def music_compose(
 @music.command("chat")
 @click.argument("message")
 @click.option("--session", "session_id", default=None, help="Existing session ID to resume.")
+@click.option("--session-title", default=None, help="Session title for Flow Music sidebar.")
 @click.option("--ref-audio", type=click.Path(exists=True, dir_okay=False, path_type=Path))
 @click.option("--ref-image", type=click.Path(exists=True, dir_okay=False, path_type=Path))
 @click.option("--wait-clip/--no-wait-clip", default=True, show_default=True)
@@ -271,6 +296,7 @@ def music_compose(
 def music_chat(
     message: str,
     session_id: str | None,
+    session_title: str | None,
     ref_audio: Path | None,
     ref_image: Path | None,
     wait_clip: bool,
@@ -294,6 +320,7 @@ def music_chat(
             _profile_dir(profile),
             message,
             session_id=session_id,
+            session_title=session_title,
             ref_audio=ref_audio,
             ref_image=ref_image,
             wait_clip=wait_clip,
@@ -326,6 +353,15 @@ def music_chat(
 @click.option("--instrumental", is_flag=True, default=False, help="Instrumental-only Compose mode.")
 @click.option("--advanced-sound", is_flag=True, default=False)
 @click.option("--model", default=None, help="Model name (e.g. 'Lyria 3.5').")
+@click.option("--bpm", type=click.IntRange(40, 240), default=None, help="Target tempo in BPM.")
+@click.option(
+    "--length",
+    default=None,
+    help="Target track length in seconds (e.g. 90) or M:SS (clamped to FlowMusic min 1:00).",
+)
+@click.option("--seed", default=None, help="Optional generation seed.")
+@click.option("--title", default=None, help="Native song title (defaults to '<slug> <shot>').")
+@click.option("--session-title", default=None, help="Session title for Flow Music sidebar.")
 @click.option("--ref-audio", type=click.Path(exists=True, dir_okay=False, path_type=Path))
 @click.option("--ref-image", type=click.Path(exists=True, dir_okay=False, path_type=Path))
 @click.option("--out-file", type=click.Path(dir_okay=False, path_type=Path), default=None)
@@ -351,6 +387,11 @@ def music_generate(
     instrumental: bool,
     advanced_sound: bool,
     model: str | None,
+    bpm: int | None,
+    length: str | None,
+    seed: str | None,
+    title: str | None,
+    session_title: str | None,
     ref_audio: Path | None,
     ref_image: Path | None,
     out_file: Path | None,
@@ -377,6 +418,11 @@ def music_generate(
             instrumental=instrumental,
             advanced_sound=advanced_sound,
             model=model,
+            bpm=bpm,
+            length=length,
+            seed=seed,
+            title=title,
+            session_title=session_title,
             out_file=out_file,
             project_dir=project_dir,
             shot=shot,
@@ -580,3 +626,33 @@ def music_probe(profile: str | None, url: str, as_json: bool, output_format: str
             )
 
     run_with_handlers(_run, cli_command="music probe", as_json=fmt == "json", output_format=fmt)
+
+
+@spends_credits(False)
+@music.command("rename-session")
+@click.argument("session_id")
+@click.argument("title")
+@click.option("--profile", default=None, help="Profile name (overrides default).")
+@output_format_option(allow_id=False)
+def music_rename_session(
+    session_id: str,
+    title: str,
+    profile: str | None,
+    as_json: bool,
+    output_format: str = "table",
+) -> None:
+    """Rename an existing Flow Music conversation session."""
+    fmt = _fmt(as_json, output_format)
+
+    async def _run() -> None:
+        payload = await rename_flowmusic_session(_profile_dir(profile), session_id, title)
+        if fmt == OutputFormat.JSON.value:
+            json_output.emit(payload)
+        elif payload.get("renamed"):
+            console.print(f"Renamed session [bold]{session_id}[/bold] -> {payload['title']}")
+        else:
+            console.print(f"[yellow]Could not rename session {session_id}[/yellow]")
+
+    run_with_handlers(
+        _run, cli_command="music rename-session", as_json=fmt == "json", output_format=fmt
+    )

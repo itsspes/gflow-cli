@@ -45,6 +45,7 @@ async def gflow_qa_check(
     project_dir: str | None = None,
     target_duration: float | None = None,
     target_bpm: float | None = None,
+    expect_audio: bool = False,
 ) -> dict[str, Any]:
     return await asyncio.to_thread(
         run_qa_check,
@@ -53,6 +54,7 @@ async def gflow_qa_check(
         project_dir=Path(project_dir).expanduser() if project_dir else None,
         target_duration=target_duration,
         target_bpm=target_bpm,
+        expect_audio=expect_audio,
     )
 
 

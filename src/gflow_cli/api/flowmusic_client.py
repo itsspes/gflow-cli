@@ -64,6 +64,14 @@ INSTRUMENTAL_SWITCH_SELECTOR = 'button[role="switch"][aria-label="Toggle instrum
 SOUND_DESC_SELECTOR = 'textarea[aria-label="Sound description"]'
 ADVANCED_SOUND_SWITCH_SELECTOR = 'button[role="switch"][aria-label="Toggle advanced sound mode"]'
 EXPAND_DETAILS_SELECTOR = 'button[aria-label="Expand Details section"]'
+BPM_INPUT_SELECTOR = 'label:has-text("BPM") + input'
+LENGTH_INPUT_SELECTOR = 'label:has-text("Length") + input'
+SEED_INPUT_SELECTOR = 'label:has-text("Seed") + div input'
+MODEL_TRIGGER_SELECTOR = 'label:has-text("Model") + button'
+TITLE_TEXTAREA_SELECTOR = (
+    'button[aria-label="Collapse Details section"] + div textarea[maxlength="100"]'
+)
+TITLE_TEXTAREA_FALLBACK_SELECTOR = 'div:has(> div:text-is("Add title (optional)")) > textarea'
 GENERATE_BUTTON_SELECTOR = 'button:has-text("Generate")'
 
 PROMPT_SELECTOR = 'textarea[aria-label="Chat message"]'
@@ -117,6 +125,71 @@ _AUDIO_SRCS_JS = """() => {
   }
   return urls;
 }"""
+
+_UI_ERROR_JS = """() => {
+  const needles = [
+    'something went wrong',
+    'failed to generate',
+    'unable to generate',
+    'generation failed',
+  ];
+  for (const el of document.querySelectorAll('[role="alert"], [data-sonner-toast]')) {
+    const rect = el.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) continue;
+    const text = (el.innerText || el.textContent || '').trim();
+    const low = text.toLowerCase();
+    if (needles.some((n) => low.includes(n))) return text.slice(0, 300);
+  }
+  return '';
+}"""
+
+_MIN_FLOWMUSIC_LENGTH_S = 60
+_LENGTH_MMSS_RE = re.compile(r"^(\d{1,2}):(\d{2})$")
+_BEARER_SCRUB_RE = re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._~+/=-]{8,}")
+
+
+def format_flowmusic_length(value: str | int | float) -> str:
+    """Format length for Flow Music's ``M:SS`` Length input, clamping ``< 60s`` to ``1:00``."""
+    if isinstance(value, bool):
+        msg = f"Invalid Flow Music length: {value!r}"
+        raise ValueError(msg)
+    total_sec: int
+    if isinstance(value, (int, float)):
+        if value <= 0:
+            msg = f"Flow Music length must be positive, got {value!r}"
+            raise ValueError(msg)
+        total_sec = round(value)
+    else:
+        raw = value.strip()
+        if not raw:
+            msg = "Flow Music length must not be empty."
+            raise ValueError(msg)
+        mmss = _LENGTH_MMSS_RE.fullmatch(raw)
+        if mmss:
+            mins, secs = int(mmss.group(1)), int(mmss.group(2))
+            if secs >= 60:
+                msg = f"Invalid M:SS length {value!r}: seconds must be < 60."
+                raise ValueError(msg)
+            total_sec = mins * 60 + secs
+            if total_sec <= 0:
+                msg = f"Flow Music length must be positive, got {value!r}"
+                raise ValueError(msg)
+        else:
+            try:
+                num = float(raw)
+            except ValueError as exc:
+                msg = f"Invalid Flow Music length {value!r}: use seconds (e.g. 90) or M:SS."
+                raise ValueError(msg) from exc
+            if num <= 0:
+                msg = f"Flow Music length must be positive, got {value!r}"
+                raise ValueError(msg)
+            total_sec = round(num)
+    clamped = max(_MIN_FLOWMUSIC_LENGTH_S, total_sec)
+    return f"{clamped // 60}:{clamped % 60:02d}"
+
+
+def _scrub_error_snippet(text: str) -> str:
+    return _BEARER_SCRUB_RE.sub(r"\1[REDACTED]", text.strip())[:300]
 
 
 class FlowMusicError(GFlowError):
@@ -230,6 +303,7 @@ class FlowMusicClient:
         self._context: BrowserContext | None = None
         self._page: Page | None = None
         self._api_cache: dict[str, Any] = {}
+        self._api_errors: list[dict[str, Any]] = []
         self._observed_urls: list[dict[str, str]] = []
         self._captured_audio: list[CapturedAudioPayload] = []
         self._pending_tasks: set[asyncio.Task[None]] = set()
@@ -313,6 +387,7 @@ class FlowMusicClient:
         self._page = None
         self._listeners_attached = False
         self._session_auth_header = None
+        self._api_errors.clear()
         if self._lease is not None:
             self._lease.release()
             self._lease = None
@@ -331,6 +406,15 @@ class FlowMusicClient:
                     {"url": url, "status": str(resp.status), "content_type": ctype}
                 )
             if resp.status >= 400:
+                if "/__api/" in parsed.path:
+                    snippet = ""
+                    try:
+                        snippet = _scrub_error_snippet(await resp.text())
+                    except Exception:
+                        snippet = ""
+                    self._api_errors.append(
+                        {"status": resp.status, "path": parsed.path, "detail": snippet}
+                    )
                 return
             if "/__api/" in parsed.path and "json" in ctype.lower():
                 try:
@@ -612,6 +696,57 @@ class FlowMusicClient:
             raise FlowMusicError(detail=f"Failed to download {url} (HTTP {resp.status}).")
         return await resp.body(), resp.headers.get("content-type")
 
+    async def _check_fast_fail_errors(self) -> None:
+        """Raise ``FlowMusicError`` immediately if an API error or UI error banner appeared."""
+        for err in self._api_errors:
+            path = str(err.get("path", ""))
+            status = int(err.get("status", 0))
+            if status >= 400 and (
+                path.startswith("/__api/producer/") or path.startswith("/__api/clips")
+            ):
+                detail = str(err.get("detail") or "").strip()
+                suffix = f": {detail}" if detail else ""
+                raise FlowMusicError(
+                    detail=f"Flow Music API error HTTP {status} on {path}{suffix}",
+                    remediation_hint=(
+                        "Retry `gflow music compose` or verify prompt/advanced inputs."
+                    ),
+                )
+        try:
+            ui_err: Any = await self.page.evaluate(_UI_ERROR_JS)
+        except Exception:
+            ui_err = None
+        if isinstance(ui_err, str) and ui_err.strip():
+            raise FlowMusicError(
+                detail=f"Flow Music UI error: {ui_err.strip()}",
+                remediation_hint=("Retry `gflow music compose` or verify prompt/advanced inputs."),
+            )
+
+    async def rename_session(self, session_id: str, title: str) -> bool:
+        """Rename a Flow Music conversation via ``PATCH /__api/conversations/<id>``."""
+        clean_title = title.strip()[:100]
+        if not session_id or not clean_title:
+            return False
+        api_path = f"/__api/conversations/{session_id}"
+        try:
+            ok: Any = await self.page.evaluate(
+                """async ([u, newTitle, auth]) => {
+                  const headers = { 'Content-Type': 'application/json' };
+                  if (auth) headers.Authorization = auth;
+                  const r = await fetch(u, {
+                    method: 'PATCH',
+                    credentials: 'include',
+                    headers,
+                    body: JSON.stringify({ title: newTitle }),
+                  });
+                  return r.ok;
+                }""",
+                [api_path, clean_title, self._session_auth_header],
+            )
+            return bool(ok)
+        except Exception:
+            return False
+
     async def _wait_for_new_clip(
         self,
         *,
@@ -625,6 +760,7 @@ class FlowMusicClient:
         first_seen_at: dict[str, float] = {}
         pref = preferred_format.lstrip(".").lower()
         while time.monotonic() < deadline:
+            await self._check_fast_fail_errors()
             # 1. Check cached/fresh /__api/clips/auth-user + passive /__api/clips dict.
             self._api_cache.pop("/__api/clips/auth-user", None)
             raw = await self._in_page_get_json(
@@ -723,6 +859,78 @@ class FlowMusicClient:
             if c.id
         }
 
+    async def _select_model(self, model: str) -> None:
+        """Select a model from the Advanced Sound dropdown only if not already selected."""
+        want = model.strip()
+        if not want:
+            return
+        trigger = self.page.locator(MODEL_TRIGGER_SELECTOR).first
+        try:
+            if not await trigger.is_visible(timeout=1_500):
+                return
+            current_text = (await trigger.inner_text(timeout=1_000)).strip().lower()
+            if want.lower() in current_text:
+                return
+            await trigger.click()
+            await self.page.wait_for_timeout(250)
+            menu_item = self.page.locator('[role="menuitem"]').filter(has_text=want).first
+            if await menu_item.is_visible(timeout=1_500):
+                await menu_item.click()
+            else:
+                alt = self.page.get_by_role("menuitem", name=want, exact=False).first
+                if await alt.is_visible(timeout=1_000):
+                    await alt.click()
+            await self.page.wait_for_timeout(200)
+        except Exception:
+            return
+
+    async def _fill_song_title(self, title: str) -> None:
+        """Expand the Details section and populate Flow Music's native song title input."""
+        clean = title.strip()[:100]
+        if not clean:
+            return
+        try:
+            expand = self.page.locator(EXPAND_DETAILS_SELECTOR).first
+            if await expand.is_visible(timeout=1_000):
+                await expand.click()
+                await self.page.wait_for_timeout(250)
+            for selector in (TITLE_TEXTAREA_SELECTOR, TITLE_TEXTAREA_FALLBACK_SELECTOR):
+                box = self.page.locator(selector).first
+                if await box.is_visible(timeout=1_000):
+                    await box.fill(clean)
+                    return
+        except Exception:
+            return
+
+    async def _fill_advanced_controls(
+        self,
+        *,
+        bpm: int | None,
+        formatted_length: str | None,
+        seed: str | None,
+        model: str | None,
+    ) -> None:
+        if bpm is not None:
+            bpm_input = self.page.locator(BPM_INPUT_SELECTOR).first
+            if await bpm_input.is_visible(timeout=1_500):
+                await bpm_input.fill(str(bpm))
+        if formatted_length is not None:
+            len_input = self.page.locator(LENGTH_INPUT_SELECTOR).first
+            if await len_input.is_visible(timeout=1_500):
+                await len_input.fill(formatted_length)
+                blur = getattr(len_input, "blur", None)
+                if callable(blur):
+                    try:
+                        await blur()  # type: ignore[misc]
+                    except Exception:
+                        pass
+        if seed is not None:
+            seed_input = self.page.locator(SEED_INPUT_SELECTOR).first
+            if await seed_input.is_visible(timeout=1_500):
+                await seed_input.fill(str(seed))
+        if model is not None:
+            await self._select_model(model)
+
     async def compose(
         self,
         sound_description: str,
@@ -731,13 +939,20 @@ class FlowMusicClient:
         instrumental: bool = False,
         advanced_sound: bool = False,
         model: str | None = None,
+        bpm: int | None = None,
+        length: str | None = None,
+        seed: str | None = None,
+        title: str | None = None,
+        session_title: str | None = None,
         preferred_format: str = "wav",
         timeout_seconds: float = 240.0,
     ) -> tuple[CapturedAudioPayload, str | None]:
         """Drive Compose mode on ``/session?t=true`` and return the downloaded clip payload."""
+        formatted_length = format_flowmusic_length(length) if length is not None else None
         await self.ensure_authenticated(url=FLOWMUSIC_SESSION_URL)
         existing_ids = await self._fetch_current_clip_ids(limit=20)
         self._captured_audio.clear()
+        self._api_errors.clear()
 
         sound_box = self.page.locator(SOUND_DESC_SELECTOR).first
         if not await sound_box.is_visible(timeout=1_500):
@@ -747,23 +962,23 @@ class FlowMusicClient:
                 await self.page.wait_for_timeout(400)
 
         await self._set_switch(INSTRUMENTAL_SWITCH_SELECTOR, instrumental)
-        if advanced_sound:
+        need_advanced = advanced_sound or any(
+            v is not None for v in (bpm, formatted_length, seed, model)
+        )
+        if need_advanced:
             await self._set_switch(ADVANCED_SOUND_SWITCH_SELECTOR, True)
+            await self._fill_advanced_controls(
+                bpm=bpm, formatted_length=formatted_length, seed=seed, model=model
+            )
         if not instrumental and lyrics:
             lyrics_box = self.page.locator(LYRICS_SELECTOR).first
             if await lyrics_box.is_visible(timeout=1_500):
                 await lyrics_box.fill(lyrics)
+        if title:
+            await self._fill_song_title(title)
 
         await sound_box.wait_for(state="visible", timeout=15_000)
         await sound_box.fill(sound_description)
-
-        if model:
-            try:
-                model_btn = self.page.get_by_role("button", name=model, exact=False).first
-                if await model_btn.is_visible(timeout=1_000):
-                    await model_btn.click()
-            except Exception:
-                pass
 
         await self.page.locator(GENERATE_BUTTON_SELECTOR).first.click()
         payload = await self._wait_for_new_clip(
@@ -771,13 +986,18 @@ class FlowMusicClient:
             preferred_format=preferred_format,
             timeout_seconds=timeout_seconds,
         )
-        return payload, extract_session_id(self.page.url)
+        session_id = extract_session_id(self.page.url)
+        effective_session_title = (session_title or title or "").strip()
+        if session_id and effective_session_title:
+            await self.rename_session(session_id, effective_session_title)
+        return payload, session_id
 
     async def chat(
         self,
         message: str,
         *,
         session_id: str | None = None,
+        session_title: str | None = None,
         ref_audio: Path | None = None,
         ref_image: Path | None = None,
         wait_clip: bool = True,
@@ -795,6 +1015,7 @@ class FlowMusicClient:
             await self._fetch_current_clip_ids(limit=20) if wait_clip else set()
         )
         self._captured_audio.clear()
+        self._api_errors.clear()
 
         if ref_audio is not None:
             await self.page.locator(UPLOAD_AUDIO_SELECTOR).set_input_files(
@@ -819,7 +1040,10 @@ class FlowMusicClient:
             )
         else:
             await self.page.wait_for_timeout(3_000)
-        return extract_session_id(self.page.url) or session_id, self.page.url, payload
+        resolved_session = extract_session_id(self.page.url) or session_id
+        if resolved_session and session_title and session_title.strip():
+            await self.rename_session(resolved_session, session_title.strip())
+        return resolved_session, self.page.url, payload
 
     async def download_clip(
         self,

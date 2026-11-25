@@ -71,6 +71,7 @@ __all__ = [
     "check_flowmusic_status",
     "chat_flowmusic",
     "compose_flowmusic",
+    "derive_project_music_titles",
     "download_flowmusic_clip",
     "generate_flowmusic",
     "get_flowmusic_credits",
@@ -84,8 +85,37 @@ __all__ = [
     "list_flowmusic_videos",
     "login_flowmusic",
     "probe_flowmusic_ui",
+    "rename_flowmusic_session",
     "resolve_music_output_path",
 ]
+
+
+def derive_project_music_titles(
+    project_dir: Path | None,
+    *,
+    shot: str = "s01",
+    title: str | None = None,
+    session_title: str | None = None,
+) -> tuple[str | None, str | None]:
+    """Derive ``(song_title, session_title)`` aligned to ``project.json`` slug when present."""
+    slug: str | None = None
+    if project_dir is not None:
+        from gflow_cli.services.project_workspace import load_manifest
+
+        root = project_dir.expanduser().resolve()
+        try:
+            slug = str(load_manifest(root).get("slug") or "").strip() or None
+        except (FileNotFoundError, OSError, ValueError):
+            slug = root.name or None
+
+    clean_title = title.strip() if title and title.strip() else None
+    clean_session = session_title.strip() if session_title and session_title.strip() else None
+
+    song_title = clean_title if clean_title is not None else (f"{slug} {shot}" if slug else None)
+    resolved_session = (
+        clean_session if clean_session is not None else (slug if slug else song_title)
+    )
+    return song_title, resolved_session
 
 
 def resolve_music_output_path(
@@ -342,6 +372,25 @@ async def probe_flowmusic_ui(
         return await client.probe_ui(url=url)
 
 
+async def rename_flowmusic_session(
+    profile_dir: Path,
+    session_id: str,
+    title: str,
+    *,
+    settings: Settings | None = None,
+) -> dict[str, Any]:
+    """Rename an existing Flow Music conversation session."""
+    async with FlowMusicClient(profile_dir, background=True, settings=settings) as client:
+        await client.ensure_authenticated(url=FLOWMUSIC_URL)
+        renamed = await client.rename_session(session_id, title)
+    return {
+        "status": "renamed" if renamed else "failed",
+        "renamed": renamed,
+        "session_id": session_id,
+        "title": title.strip()[:100],
+    }
+
+
 async def compose_flowmusic(
     profile_dir: Path,
     sound_description: str,
@@ -350,6 +399,11 @@ async def compose_flowmusic(
     instrumental: bool = False,
     advanced_sound: bool = False,
     model: str | None = None,
+    bpm: int | None = None,
+    length: str | None = None,
+    seed: str | None = None,
+    title: str | None = None,
+    session_title: str | None = None,
     out_file: Path | None = None,
     project_dir: Path | None = None,
     shot: str = "s01",
@@ -363,6 +417,9 @@ async def compose_flowmusic(
     if not sound_description.strip():
         msg = "Sound description must not be empty."
         raise ValueError(msg)
+    song_title, resolved_session_title = derive_project_music_titles(
+        project_dir, shot=shot, title=title, session_title=session_title
+    )
     async with FlowMusicClient(profile_dir, background=True, settings=settings) as client:
         payload, session_id = await client.compose(
             sound_description,
@@ -370,6 +427,11 @@ async def compose_flowmusic(
             instrumental=instrumental,
             advanced_sound=advanced_sound,
             model=model,
+            bpm=bpm,
+            length=length,
+            seed=seed,
+            title=song_title,
+            session_title=resolved_session_title,
             preferred_format=preferred_format,
             timeout_seconds=timeout_seconds,
         )
@@ -392,6 +454,7 @@ async def chat_flowmusic(
     message: str,
     *,
     session_id: str | None = None,
+    session_title: str | None = None,
     ref_audio: Path | None = None,
     ref_image: Path | None = None,
     wait_clip: bool = True,
@@ -408,10 +471,14 @@ async def chat_flowmusic(
     if not message.strip():
         msg = "Chat message must not be empty."
         raise ValueError(msg)
+    _, resolved_session_title = derive_project_music_titles(
+        project_dir, shot=shot, session_title=session_title
+    )
     async with FlowMusicClient(profile_dir, background=True, settings=settings) as client:
         resolved_session, session_url, payload = await client.chat(
             message,
             session_id=session_id,
+            session_title=resolved_session_title,
             ref_audio=ref_audio,
             ref_image=ref_image,
             wait_clip=wait_clip,
@@ -483,6 +550,11 @@ async def generate_flowmusic(
     instrumental: bool = False,
     advanced_sound: bool = False,
     model: str | None = None,
+    bpm: int | None = None,
+    length: str | None = None,
+    seed: str | None = None,
+    title: str | None = None,
+    session_title: str | None = None,
     out_file: Path | None = None,
     project_dir: Path | None = None,
     shot: str = "s01",
@@ -501,6 +573,7 @@ async def generate_flowmusic(
             profile_dir,
             prompt,
             session_id=session_id,
+            session_title=session_title,
             ref_audio=ref_audio,
             ref_image=ref_image,
             wait_clip=True,
@@ -526,6 +599,11 @@ async def generate_flowmusic(
         instrumental=instrumental,
         advanced_sound=advanced_sound,
         model=model,
+        bpm=bpm,
+        length=length,
+        seed=seed,
+        title=title,
+        session_title=session_title,
         out_file=out_file,
         project_dir=project_dir,
         shot=shot,

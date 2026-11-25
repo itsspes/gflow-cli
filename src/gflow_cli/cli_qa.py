@@ -42,6 +42,12 @@ def qa() -> None:
 )
 @click.option("--target-duration", type=float, default=None, help="Expected duration in seconds.")
 @click.option("--target-bpm", type=float, default=None, help="Expected music tempo in BPM.")
+@click.option(
+    "--expect-audio",
+    is_flag=True,
+    default=False,
+    help="Expect an intentional audio track on video (suppresses Veo unstripped-audio warning).",
+)
 @output_format_option(allow_id=False)
 def qa_check(
     file_path: Path,
@@ -49,6 +55,7 @@ def qa_check(
     project_dir: Path | None,
     target_duration: float | None,
     target_bpm: float | None,
+    expect_audio: bool,
     as_json: bool,
     output_format: str = "table",
 ) -> None:
@@ -60,6 +67,7 @@ def qa_check(
             project_dir=project_dir,
             target_duration=target_duration,
             target_bpm=target_bpm,
+            expect_audio=expect_audio,
         )
     except (FileNotFoundError, ValueError) as exc:
         raise click.ClickException(str(exc)) from exc

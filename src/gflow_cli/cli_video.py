@@ -1303,11 +1303,16 @@ def assemble(
     type=click.Path(file_okay=False, path_type=Path),
     default=None,
     help=(
-        "Optional project workspace directory "
-        "(writes review.json & 1 fps strip into qa/reviews/)."
+        "Optional project workspace directory (writes review.json & 1 fps strip into qa/reviews/)."
     ),
 )
 @click.option("--target-duration", type=float, default=None, help="Expected duration in seconds.")
+@click.option(
+    "--expect-audio",
+    is_flag=True,
+    default=False,
+    help="Expect an intentional audio track on video (suppresses Veo unstripped-audio warning).",
+)
 @click.option(
     "--transcribe",
     "run_transcribe",
@@ -1328,6 +1333,7 @@ def video_qa(
     video_file: Path,
     project_dir: Path | None,
     target_duration: float | None,
+    expect_audio: bool,
     run_transcribe: bool,
     whisper_backend: str,
     language: str | None,
@@ -1348,6 +1354,7 @@ def video_qa(
             kind="video",
             project_dir=project_dir,
             target_duration=target_duration,
+            expect_audio=expect_audio,
         )
         if run_transcribe:
             lw = importlib.import_module("gflow_cli.services.local_whisper")

@@ -217,6 +217,7 @@ def check_video(
     *,
     target_duration: float | None = None,
     strip_dir: Path | None = None,
+    expect_audio: bool = False,
 ) -> dict[str, Any]:
     """Run deterministic ffprobe, black-frame, audio-hygiene, and 1 fps strip checks."""
     issues: list[dict[str, str]] = []
@@ -261,19 +262,38 @@ def check_video(
         log.debug("quality_gate.video_sample_error", error=str(exc))
         black_ratio, contact_sheet = 0.0, None
 
-    if has_audio:
-        issues.append(
-            {
-                "code": "has_unstripped_audio",
-                "severity": "warn",
-                "detail": (
-                    "Video carries an audio stream (Veo clips often include room-tone noise)."
-                ),
-            }
-        )
-        next_actions.append(
-            "Strip clip audio with `gflow video assemble --strip-veo-audio` for B-roll."
-        )
+    if expect_audio:
+        has_unstripped_audio = False
+        if not has_audio:
+            issues.append(
+                {
+                    "code": "missing_expected_audio",
+                    "severity": "warn",
+                    "detail": (
+                        "Expected an audio track on this mastered video, "
+                        "but no audio stream was found."
+                    ),
+                }
+            )
+            next_actions.append(
+                "Assemble with music/voiceover (`gflow video assemble --music ...`) "
+                "or omit --expect-audio for silent B-roll."
+            )
+    else:
+        has_unstripped_audio = has_audio
+        if has_audio:
+            issues.append(
+                {
+                    "code": "has_unstripped_audio",
+                    "severity": "warn",
+                    "detail": (
+                        "Video carries an audio stream (Veo clips often include room-tone noise)."
+                    ),
+                }
+            )
+            next_actions.append(
+                "Strip clip audio with `gflow video assemble --strip-veo-audio` for B-roll."
+            )
     if black_ratio >= 0.8:
         issues.append(
             {
@@ -306,7 +326,8 @@ def check_video(
             "fps": fps,
             "duration_seconds": round(duration, 3),
             "has_audio_stream": has_audio,
-            "has_unstripped_audio": has_audio,
+            "has_unstripped_audio": has_unstripped_audio,
+            "expect_audio": expect_audio,
             "black_frame_ratio": black_ratio,
             "contact_sheet": contact_sheet,
         },
@@ -421,8 +442,7 @@ def check_audio(
                 "code": "true_peak_clipping",
                 "severity": "warn",
                 "detail": (
-                    f"True peak {peak:.2f} dBTP exceeds "
-                    f"{_TRUE_PEAK_CEILING_DBTP:.1f} dBTP ceiling."
+                    f"True peak {peak:.2f} dBTP exceeds {_TRUE_PEAK_CEILING_DBTP:.1f} dBTP ceiling."
                 ),
             }
         )
@@ -479,6 +499,7 @@ def run_qa_check(
     project_dir: Path | None = None,
     target_duration: float | None = None,
     target_bpm: float | None = None,
+    expect_audio: bool = False,
 ) -> dict[str, Any]:
     """Run Stage-1 deterministic QA check and optionally persist ``review.json``."""
     target = file_path.expanduser().resolve()
@@ -492,7 +513,12 @@ def run_qa_check(
     if resolved_kind == "image":
         result = check_image(target)
     elif resolved_kind == "video":
-        result = check_video(target, target_duration=target_duration, strip_dir=strip_dir)
+        result = check_video(
+            target,
+            target_duration=target_duration,
+            strip_dir=strip_dir,
+            expect_audio=expect_audio,
+        )
     elif resolved_kind == "audio":
         result = check_audio(target, target_duration=target_duration, target_bpm=target_bpm)
     else:
