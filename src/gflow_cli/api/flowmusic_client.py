@@ -202,6 +202,8 @@ def _extract_items_list(payload: Any, keys: tuple[str, ...]) -> list[dict[str, A
             val = d.get(key)
             if isinstance(val, list):
                 return [x for x in cast("list[Any]", val) if isinstance(x, dict)]
+            if isinstance(val, dict):
+                return [x for x in cast("dict[str, Any]", val).values() if isinstance(x, dict)]
         data = d.get("data")
         if isinstance(data, list):
             return [x for x in cast("list[Any]", data) if isinstance(x, dict)]
@@ -623,13 +625,17 @@ class FlowMusicClient:
         first_seen_at: dict[str, float] = {}
         pref = preferred_format.lstrip(".").lower()
         while time.monotonic() < deadline:
-            # 1. Check cached/fresh /__api/clips/auth-user for a new clip with audio URL.
+            # 1. Check cached/fresh /__api/clips/auth-user + passive /__api/clips dict.
             self._api_cache.pop("/__api/clips/auth-user", None)
             raw = await self._in_page_get_json(
                 "/__api/clips/auth-user?limit=10&offset=0&filter=generations&include_disliked=false"
             )
+            candidates = _extract_items_list(raw, ("clips",))
+            passive_clips = self._api_cache.get("/__api/clips")
+            if passive_clips is not None:
+                candidates.extend(_extract_items_list(passive_clips, ("clips",)))
             now = time.monotonic()
-            for item in _extract_items_list(raw, ("clips",)):
+            for item in candidates:
                 clip = FlowMusicClip.from_api(item)
                 if clip.id and clip.id not in existing_ids:
                     first_seen_at.setdefault(clip.id, now)
@@ -644,7 +650,11 @@ class FlowMusicClient:
                         continue
                     dl_url, ext = clip.preferred_download_url(pref)
                     if dl_url:
-                        body, ctype = await self._fetch_bytes(dl_url)
+                        try:
+                            body, ctype = await self._fetch_bytes(dl_url)
+                        except FlowMusicError:
+                            # GCS object may briefly 404 while WAV finishes writing.
+                            continue
                         if len(body) >= _MIN_AUDIO_BYTES:
                             final_ext = infer_audio_extension(
                                 content_type=ctype, url=dl_url, fallback=ext

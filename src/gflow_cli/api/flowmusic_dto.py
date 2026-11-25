@@ -19,7 +19,45 @@ def _str_or_none(val: object) -> str | None:
 def _float_or_none(val: object) -> float | None:
     if isinstance(val, (int, float)) and not isinstance(val, bool):
         return float(val)
+    if isinstance(val, str) and val.strip():
+        try:
+            return float(val.strip())
+        except ValueError:
+            return None
     return None
+
+
+def _parse_duration(val: object) -> tuple[float | None, str | None]:
+    """Parse live Flow Music duration (float/int/str or ``{"status", "value"}`` dict)."""
+    if isinstance(val, dict):
+        d = cast("dict[str, Any]", val)
+        return _float_or_none(d.get("value")), _str_or_none(d.get("status"))
+    return _float_or_none(val), None
+
+
+def _parse_lyrics(val: object) -> str | None:
+    """Parse live Flow Music lyrics (str or ``{"status", "value": {"text": ...}}`` dict)."""
+    if isinstance(val, str):
+        return _str_or_none(val)
+    if isinstance(val, dict):
+        d = cast("dict[str, Any]", val)
+        inner = d.get("value")
+        if isinstance(inner, dict):
+            return _str_or_none(cast("dict[str, Any]", inner).get("text"))
+        return _str_or_none(inner)
+    return None
+
+
+def _has_completed_lyrics_timing(val: object) -> bool:
+    """True only when ``lyrics_timing`` is populated/completed (not ``not_requested``)."""
+    if val is None:
+        return False
+    if isinstance(val, dict):
+        d = cast("dict[str, Any]", val)
+        if "status" in d:
+            return str(d.get("status")) == "completed"
+        return bool(d)
+    return True
 
 
 @dataclass(frozen=True)
@@ -120,10 +158,13 @@ class FlowMusicClip:
     created_at: str | None = None
     op_id: str | None = None
     op_type: str | None = None
+    status: str | None = None
 
     @classmethod
     def from_api(cls, raw: dict[str, Any]) -> FlowMusicClip:
         vocals = raw.get("has_vocals")
+        duration, dur_status = _parse_duration(raw.get("duration"))
+        clip_status = dur_status or _str_or_none(raw.get("status"))
         return cls(
             id=str(raw.get("id") or ""),
             title=str(raw.get("title") or ""),
@@ -131,8 +172,8 @@ class FlowMusicClip:
             wav_url=_str_or_none(raw.get("wav_url")),
             image_url=_str_or_none(raw.get("image_url")),
             video_url=_str_or_none(raw.get("video_url")),
-            duration=_float_or_none(raw.get("duration")),
-            lyrics=_str_or_none(raw.get("lyrics")),
+            duration=duration,
+            lyrics=_parse_lyrics(raw.get("lyrics")),
             lyrics_timing=raw.get("lyrics_timing"),
             has_vocals=bool(vocals) if isinstance(vocals, bool) else None,
             is_favorite=bool(raw.get("is_favorite", False)),
@@ -140,6 +181,7 @@ class FlowMusicClip:
             created_at=_str_or_none(raw.get("created_at")),
             op_id=_str_or_none(raw.get("op_id")),
             op_type=_str_or_none(raw.get("op_type")),
+            status=clip_status,
         )
 
     def preferred_download_url(self, preferred_format: str = "wav") -> tuple[str | None, str]:
@@ -165,13 +207,15 @@ class FlowMusicClip:
             "video_url": self.video_url,
             "duration": self.duration,
             "lyrics": self.lyrics,
-            "has_lyrics_timing": self.lyrics_timing is not None,
+            "has_lyrics_timing": _has_completed_lyrics_timing(self.lyrics_timing),
             "has_vocals": self.has_vocals,
             "is_favorite": self.is_favorite,
             "is_remix_eligible": self.is_remix_eligible,
             "created_at": self.created_at,
             "op_id": self.op_id,
             "op_type": self.op_type,
+            "status": self.status,
+            "is_completed": self.status == "completed",
         }
 
 
