@@ -51,12 +51,49 @@ FAMILY_KEY: Mapping[VideoModel, str] = MappingProxyType(
     }
 )
 
+#: Recommended replacement for each retiring video model ahead of 2026-12-05.
+RECOMMENDED_REPLACEMENT: Mapping[VideoModel, VideoModel] = MappingProxyType(
+    {
+        VideoModel.OMNI_FLASH: VideoModel.OMNI_1_2_FLASH,
+        VideoModel.VEO_3_1_FAST: VideoModel.VEO_3_1_LITE,
+        VideoModel.VEO_3_1_QUALITY: VideoModel.VEO_3_1_LITE,
+    }
+)
+
+_CLI_SUGGESTION: Mapping[VideoModel, str] = MappingProxyType(
+    {
+        VideoModel.OMNI_1_2_FLASH: "omni-1.2-flash",
+        VideoModel.VEO_3_1_LITE: "veo-lite",
+    }
+)
+
 _DATE_SLOT = 6
 
 
 def retires_on(model: VideoModel) -> date | None:
     """The day Flow retires ``model``, or ``None`` when it has not said it will."""
     return RETIRES_ON.get(model)
+
+
+def recommended_replacement(model: VideoModel) -> VideoModel | None:
+    """Return the recommended successor for a retiring video model, or ``None``."""
+    return RECOMMENDED_REPLACEMENT.get(model)
+
+
+def retirement_hint(model: VideoModel, *, today: date | None = None) -> str | None:
+    """Actionable migration guidance for a retiring video model, or ``None``."""
+    when = retires_on(model)
+    if when is None:
+        return None
+    replacement = recommended_replacement(model)
+    tense = "retired on" if (today is not None and today >= when) else "retires on"
+    if replacement is None:
+        return f"Model '{model.value}' {tense} {when.isoformat()}."
+    cli_flag = _CLI_SUGGESTION.get(replacement, replacement.value)
+    return (
+        f"Model '{model.value}' {tense} {when.isoformat()}; "
+        f"migrate to '{replacement.value}' (--model {cli_flag})."
+    )
 
 
 @dataclass(frozen=True)
@@ -76,6 +113,8 @@ class RetirementNotice:
     model: VideoModel
     retires_on: date
     past: bool
+    replacement: VideoModel | None = None
+    hint: str = ""
 
 
 def warn_if_retiring(model: VideoModel, *, today: date) -> RetirementNotice | None:
@@ -87,12 +126,22 @@ def warn_if_retiring(model: VideoModel, *, today: date) -> RetirementNotice | No
     when = retires_on(model)
     if when is None:
         return None
-    notice = RetirementNotice(model=model, retires_on=when, past=today >= when)
+    replacement = recommended_replacement(model)
+    hint = retirement_hint(model, today=today) or ""
+    notice = RetirementNotice(
+        model=model,
+        retires_on=when,
+        past=today >= when,
+        replacement=replacement,
+        hint=hint,
+    )
     log.warning(
         "model.retiring",
         model=model.value,
         retires_on=when.isoformat(),
         past=notice.past,
+        replacement=replacement.value if replacement is not None else None,
+        hint=hint,
     )
     return notice
 

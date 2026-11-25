@@ -47,6 +47,7 @@ async def gflow_video_assemble(
     music_volume: float = 0.3,
     voiceover_volume: float = 1.0,
     duck: bool = True,
+    strip_veo_audio: bool = False,
     profile: str | None = None,
 ) -> dict[str, Any]:
     """Join local clips without Flow calls or credits.
@@ -60,6 +61,7 @@ async def gflow_video_assemble(
         music_volume: Music gain, from 0 to 1 (default 0.3).
         voiceover_volume: Voiceover gain, from 0 to 1 (default 1).
         duck: Reduce music and clip audio while voiceover is present (default true).
+        strip_veo_audio: Strip audio from input clips (default false).
         profile: Optional catalog profile to disambiguate media IDs.
     """
     from gflow_cli.mcp.tools import (
@@ -86,6 +88,7 @@ async def gflow_video_assemble(
             music_volume=music_volume,
             voiceover_volume=voiceover_volume,
             duck=duck,
+            strip_clip_audio=strip_veo_audio,
         )
 
     result = await asyncio.to_thread(assemble)

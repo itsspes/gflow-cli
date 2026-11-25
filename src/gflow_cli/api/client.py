@@ -499,8 +499,14 @@ class FlowApiClient(CharacterSurface, AccountBootstrap):
     async def _launch_persistent_context(self, kwargs: JsonObject) -> BrowserContext:
         """Launch the context and classify profile access versus contention failures."""
         assert self._pw is not None
+        from gflow_cli.macos_window import macos_background_launch_guard
+
         try:
-            return await self._pw.chromium.launch_persistent_context(**kwargs)
+            async with macos_background_launch_guard(
+                headless=self.headless,
+                enabled=self.settings.macos_background_launch,
+            ):
+                return await self._pw.chromium.launch_persistent_context(**kwargs)
         except Exception as exc:
             # Before _is_target_closed: an access denial can arrive as a
             # TargetClosedError too, and must not be reported as contention.

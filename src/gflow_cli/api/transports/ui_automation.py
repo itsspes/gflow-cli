@@ -233,21 +233,27 @@ class UiAutomationTransport(VideoGenerationMixin, ImageGenerationMixin):
             # #477: refuse a bundled-Chromium open of a profile last written by
             # a newer Chromium — downgrade cleanup can shred the session store.
             ensure_profile_engine_compatible(profile_dir, channel)
-            ctx = await pw.chromium.launch_persistent_context(
-                str(profile_dir),
+            from gflow_cli.macos_window import macos_background_launch_guard
+
+            async with macos_background_launch_guard(
                 headless=False,
-                viewport=cast("ViewportSize", _VIEWPORT),
-                locale=locale_env,
-                channel=channel,
-                args=[
-                    "--disable-blink-features=AutomationControlled",
-                    "--password-store=basic",
-                    "--disable-dev-shm-usage",
-                    *window_position_args(get_settings().browser_window_position),
-                    *disable_features_args(),
-                ],
-                **browser_proxy_kwargs(get_settings().browser_proxy),
-            )
+                enabled=get_settings().macos_background_launch,
+            ):
+                ctx = await pw.chromium.launch_persistent_context(
+                    str(profile_dir),
+                    headless=False,
+                    viewport=cast("ViewportSize", _VIEWPORT),
+                    locale=locale_env,
+                    channel=channel,
+                    args=[
+                        "--disable-blink-features=AutomationControlled",
+                        "--password-store=basic",
+                        "--disable-dev-shm-usage",
+                        *window_position_args(get_settings().browser_window_position),
+                        *disable_features_args(),
+                    ],
+                    **browser_proxy_kwargs(get_settings().browser_proxy),
+                )
             # Hide the automation flag so reCAPTCHA Enterprise doesn't score
             # the session as a bot — navigator.webdriver=true causes low-score
             # tokens and HTTP 403 on batchGenerateImages.

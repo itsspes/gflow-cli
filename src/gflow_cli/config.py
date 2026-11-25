@@ -579,6 +579,42 @@ class Settings(BaseSettings):
             "GFLOW_CLI_BROWSER_WINDOW_POSITION."
         ),
     )
+    macos_background_launch: bool = Field(
+        default=True,
+        description=(
+            "On macOS (darwin), hide headed Chrome and restore the previous frontmost "
+            "application immediately after non-login browser launches so generation "
+            "does not steal keyboard focus. Interactive `gflow auth login` always stays "
+            "foreground. No-op off macOS, in headless mode, or in CI. Override via "
+            "GFLOW_CLI_MACOS_BACKGROUND_LAUNCH."
+        ),
+    )
+    warm_session_enabled: bool = Field(
+        default=False,
+        description=(
+            "Opt-in warm persistent browser session reuse in long-lived MCP/daemon "
+            "processes instead of cold-launching Chrome on every operation. Override "
+            "via GFLOW_CLI_WARM_SESSION_ENABLED."
+        ),
+    )
+    warm_session_ttl_seconds: float = Field(
+        default=1200.0,
+        ge=10.0,
+        le=86400.0,
+        description=(
+            "Idle TTL in seconds before a warm persistent browser session is closed "
+            "and its profile lease released (default 1200s = 20 minutes). Override "
+            "via GFLOW_CLI_WARM_SESSION_TTL_SECONDS."
+        ),
+    )
+    video_hw_accel: bool = Field(
+        default=True,
+        description=(
+            "Prefer Apple Silicon VideoToolbox (`h264_videotoolbox`) for local video "
+            "assembly on macOS, falling back automatically to `libx264` when "
+            "unavailable or off macOS. Override via GFLOW_CLI_VIDEO_HW_ACCEL."
+        ),
+    )
     browser_proxy: str | None = Field(
         default=None,
         description=(

@@ -77,6 +77,9 @@ def build_catalog() -> dict[str, Any]:
             "durations": list(video_api.duration_choices_for(m)),
             # #1375: the day Flow retires this model (ISO date), or null.
             "retires_on": (day.isoformat() if (day := model_catalog.retires_on(m)) else None),
+            "recommended_replacement": (
+                rep.value if (rep := model_catalog.recommended_replacement(m)) else None
+            ),
         }
         for m in video_api.VideoModel
     ]
@@ -214,6 +217,7 @@ _LABELS = {
     "max_duration": "max dur (s)",
     "durations": "durations (s)",
     "retires_on": "retires on",
+    "recommended_replacement": "replacement",
 }
 
 

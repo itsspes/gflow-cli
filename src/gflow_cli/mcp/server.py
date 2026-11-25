@@ -361,6 +361,9 @@ def build_app(
                 # has shut down, killing the process before asyncio.run cancels the
                 # wait=false jobs (spike 2026-10-25-mcp-detached-task-shutdown).
                 await tasks_module.drain_detached()
+                from gflow_cli.api.warm_session import close_default_warm_session_manager
+
+                await close_default_warm_session_manager()
 
     app.router.lifespan_context = lifespan
     return app
@@ -439,6 +442,9 @@ async def run_stdio() -> None:
         # Before asyncio.run cancels every task at once: that would cancel Playwright's
         # own connection too, so a wait=false job's browser could not close cleanly.
         await tasks_module.drain_detached()
+        from gflow_cli.api.warm_session import close_default_warm_session_manager
+
+        await close_default_warm_session_manager()
 
 
 async def run_http(host: str = "127.0.0.1", port: int = 8000) -> None:

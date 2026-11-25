@@ -1159,6 +1159,15 @@ def video() -> None:
     help="Duck music and clip audio under voiceover.",
 )
 @click.option(
+    "--strip-veo-audio",
+    is_flag=True,
+    default=False,
+    help=(
+        "Strip audio from input clips (removes Veo synthesized room tone; "
+        "omits the audio stream entirely when no music or voiceover is provided)."
+    ),
+)
+@click.option(
     "--out-file",
     required=True,
     type=click.Path(dir_okay=False, path_type=Path),
@@ -1177,6 +1186,7 @@ def assemble(
     music_volume: float,
     voiceover_volume: float,
     duck: bool,
+    strip_veo_audio: bool,
     out_file: Path,
     profile: str | None,
     as_json: bool,
@@ -1196,6 +1206,7 @@ def assemble(
             music_volume=music_volume,
             voiceover_volume=voiceover_volume,
             duck=duck,
+            strip_clip_audio=strip_veo_audio,
         )
         payload = assembly_result_payload(result)
         if as_json or output_format == OutputFormat.JSON.value:

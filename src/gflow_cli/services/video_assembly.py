@@ -43,6 +43,9 @@ class AssemblyResult:
     height: int
     frame_rate: float
     bytes: int
+    video_encoder: str = "libx264"
+    clip_audio_stripped: bool = False
+    has_audio_stream: bool = True
 
 
 @dataclass(frozen=True)
@@ -55,8 +58,24 @@ class _VideoLayout:
     total_samples: int
 
 
+def select_video_encoder(av: Any, *, prefer_hardware: bool = True) -> str:
+    """Choose the H.264 encoder: ``h264_videotoolbox`` on macOS when available, else ``libx264``."""
+    if prefer_hardware and sys.platform == "darwin":
+        try:
+            av.codec.Codec("h264_videotoolbox", "w")
+            return "h264_videotoolbox"
+        except Exception:  # noqa: BLE001 - fall back cleanly to software libx264
+            _log.debug("video_assembly.videotoolbox_unavailable")
+    return "libx264"
+
+
 def assembly_result_payload(result: AssemblyResult) -> dict[str, Any]:
     """The stable JSON result shape shared by the CLI and MCP adapters."""
+    audio_stream: dict[str, Any] | None = (
+        {"codec": "aac", "sample_rate": _SAMPLE_RATE, "channels": _CHANNELS}
+        if result.has_audio_stream
+        else None
+    )
     return {
         "status": "succeeded",
         "output_file": str(result.output_file),
@@ -65,13 +84,15 @@ def assembly_result_payload(result: AssemblyResult) -> dict[str, Any]:
         "has_music": result.has_music,
         "has_voiceover": result.has_voiceover,
         "ducking_applied": result.ducking_applied,
+        "clip_audio_stripped": result.clip_audio_stripped,
         "video_stream": {
             "codec": "h264",
+            "encoder": result.video_encoder,
             "width": result.width,
             "height": result.height,
             "fps": result.frame_rate,
         },
-        "audio_stream": {"codec": "aac", "sample_rate": _SAMPLE_RATE, "channels": _CHANNELS},
+        "audio_stream": audio_stream,
         "bytes": result.bytes,
     }
 
@@ -146,6 +167,8 @@ def _make_audio(
     voiceover: Path | None,
     total_samples: int,
     av: Any,
+    *,
+    strip_clip_audio: bool = False,
 ) -> list[Path]:
     """Write concatenated clip audio plus optional tracks to bounded disk spools."""
     descriptor, name = tempfile.mkstemp(suffix=".f32le")
@@ -154,8 +177,11 @@ def _make_audio(
     spools = [clip_spool]
     try:
         with clip_spool.open("wb") as target:
-            for clip, samples in clips:
-                _write_audio_pcm(clip, target, samples=samples, av=av, allow_silence=True)
+            if strip_clip_audio:
+                target.truncate(total_samples * _CHANNELS * 4)
+            else:
+                for clip, samples in clips:
+                    _write_audio_pcm(clip, target, samples=samples, av=av, allow_silence=True)
         if music is not None:
             spools.append(_pcm_spool(music, samples=total_samples, av=av))
         if voiceover is not None:
@@ -282,16 +308,26 @@ def _encode_clip(
     return pts
 
 
-def _encode_video(target: Any, clips: list[Path], layout: _VideoLayout, av: Any) -> Any:
+def _encode_video(
+    target: Any,
+    clips: list[Path],
+    layout: _VideoLayout,
+    av: Any,
+    *,
+    encoder: str = "libx264",
+    include_audio: bool = True,
+) -> Any:
     """Add output streams and encode normalized video clips in order."""
     fps = Fraction(layout.frame_rate).limit_denominator(1000)
-    video_out = target.add_stream("libx264", rate=fps)
+    video_out = target.add_stream(encoder, rate=fps)
     video_out.time_base = Fraction(1, 1) / fps
     video_out.width, video_out.height = layout.size
     video_out.pix_fmt = "yuv420p"
-    audio_out = target.add_stream("aac", rate=_SAMPLE_RATE)
-    audio_out.format = "fltp"
-    audio_out.layout = "stereo"
+    audio_out: Any = None
+    if include_audio:
+        audio_out = target.add_stream("aac", rate=_SAMPLE_RATE)
+        audio_out.format = "fltp"
+        audio_out.layout = "stereo"
     pts = 0
     for path, target_count, source_count in zip(
         clips, layout.normalized_counts, layout.frame_counts, strict=True
@@ -470,10 +506,16 @@ def _write_output(
     music: Path | None,
     voiceover: Path | None,
     av: Any,
+    encoder: str = "libx264",
+    include_audio: bool = True,
 ) -> None:
-    """Create the MP4 container and write normalized video plus the mixed audio bed."""
+    """Create the MP4 container and write normalized video plus optional mixed audio."""
     with av.open(str(output), "w", format="mp4") as target:
-        audio_out = _encode_video(target, clips, layout, av)
+        audio_out = _encode_video(
+            target, clips, layout, av, encoder=encoder, include_audio=include_audio
+        )
+        if not include_audio or audio_out is None:
+            return
         _graph, inputs, sink = _audio_graph(
             av,
             clip_volume=clip_volume,
@@ -810,6 +852,8 @@ def assemble_videos(
     music_volume: float = 0.3,
     voiceover_volume: float = 1.0,
     duck: bool = True,
+    strip_clip_audio: bool = False,
+    prefer_hardware_encoder: bool | None = None,
 ) -> AssemblyResult:
     """Join clips, normalize to the first clip, and mix optional audio locally."""
     try:
@@ -820,40 +864,74 @@ def assemble_videos(
             route="video.assemble",
             charged="no",
         ) from exc
+    from gflow_cli.config import get_settings
+
     _av: Any = av
     _validate_assembly(clips, output, music, voiceover, clip_volume, music_volume, voiceover_volume)
+    prefer_hw = (
+        get_settings().video_hw_accel
+        if prefer_hardware_encoder is None
+        else prefer_hardware_encoder
+    )
+    encoder = select_video_encoder(_av, prefer_hardware=prefer_hw)
+    include_audio = not (strip_clip_audio and music is None and voiceover is None)
     audio_spools: list[Path] = []
     temp_output: Path | None = None
     try:
         layout = _inspect_videos(clips, _av)
-        audio_spools = _make_audio(
-            [
-                (clip, round(normalized * _SAMPLE_RATE / layout.frame_rate))
-                for clip, normalized in zip(clips, layout.normalized_counts, strict=True)
-            ],
-            music,
-            voiceover,
-            layout.total_samples,
-            _av,
-        )
+        if include_audio:
+            audio_spools = _make_audio(
+                [
+                    (clip, round(normalized * _SAMPLE_RATE / layout.frame_rate))
+                    for clip, normalized in zip(clips, layout.normalized_counts, strict=True)
+                ],
+                music,
+                voiceover,
+                layout.total_samples,
+                _av,
+                strip_clip_audio=strip_clip_audio,
+            )
         descriptor, temp_name = tempfile.mkstemp(
             prefix=f".{output.stem}.", suffix=output.suffix, dir=output.parent
         )
         os.close(descriptor)
         temp_output = Path(temp_name)
-        _write_output(
-            clips,
-            temp_output,
-            layout,
-            audio_spools,
-            clip_volume=clip_volume,
-            music_volume=music_volume,
-            voiceover_volume=voiceover_volume,
-            duck=duck,
-            music=music,
-            voiceover=voiceover,
-            av=_av,
-        )
+        try:
+            _write_output(
+                clips,
+                temp_output,
+                layout,
+                audio_spools,
+                clip_volume=0.0 if strip_clip_audio else clip_volume,
+                music_volume=music_volume,
+                voiceover_volume=voiceover_volume,
+                duck=duck,
+                music=music,
+                voiceover=voiceover,
+                av=_av,
+                encoder=encoder,
+                include_audio=include_audio,
+            )
+        except _av.error.FFmpegError:
+            if encoder == "libx264":
+                raise
+            _log.warning("video_assembly.hw_encoder_fallback", failed_encoder=encoder)
+            encoder = "libx264"
+            _write_output(
+                clips,
+                temp_output,
+                layout,
+                audio_spools,
+                clip_volume=0.0 if strip_clip_audio else clip_volume,
+                music_volume=music_volume,
+                voiceover_volume=voiceover_volume,
+                duck=duck,
+                music=music,
+                voiceover=voiceover,
+                av=_av,
+                encoder=encoder,
+                include_audio=include_audio,
+            )
         publish_output(temp_output, output)
         return AssemblyResult(
             output_file=output,
@@ -866,6 +944,9 @@ def assemble_videos(
             height=layout.size[1],
             frame_rate=layout.frame_rate,
             bytes=output.stat().st_size,
+            video_encoder=encoder,
+            clip_audio_stripped=strip_clip_audio,
+            has_audio_stream=include_audio,
         )
     except VideoAssemblyError:
         raise
