@@ -6,6 +6,7 @@ import hashlib
 import json
 import re
 import shutil
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -15,8 +16,37 @@ import structlog
 log = structlog.get_logger(__name__)
 
 WORKSPACE_SCHEMA_VERSION = 1
+VALID_WORKSPACE_MODULES: tuple[str, ...] = ("image", "video", "music")
 INGREDIENT_CATEGORIES: tuple[str, ...] = ("subject", "scene", "style")
 ASSET_STATUSES: tuple[str, ...] = ("candidate", "approved", "minor_edit", "rejected")
+
+_BASE_SUBDIRS: tuple[str, ...] = ("qa/reviews", "exports")
+_MODULE_SUBDIRS: dict[str, tuple[str, ...]] = {
+    "image": (
+        "ingredients/subjects",
+        "ingredients/scenes",
+        "ingredients/styles",
+        "images/candidates",
+        "images/approved",
+        "images/rejected",
+    ),
+    "video": (
+        "ingredients/subjects",
+        "ingredients/scenes",
+        "ingredients/styles",
+        "videos/drafts",
+        "videos/masters",
+        "videos/approved",
+        "videos/rejected",
+    ),
+    "music": (
+        "audio/music",
+        "audio/voiceover",
+        "audio/analysis",
+        "audio/approved",
+        "audio/rejected",
+    ),
+}
 
 WORKSPACE_SUBDIRS: tuple[str, ...] = (
     "ingredients/subjects",
@@ -32,9 +62,47 @@ WORKSPACE_SUBDIRS: tuple[str, ...] = (
     "audio/music",
     "audio/voiceover",
     "audio/analysis",
+    "audio/approved",
+    "audio/rejected",
     "qa/reviews",
     "exports",
 )
+
+
+def parse_workspace_modules(modules: Sequence[str] | str | None) -> tuple[str, ...]:
+    """Normalize ``modules`` spec (e.g. ``'image,music'``, ``['video']``, ``'all'``, ``None``)."""
+    if modules is None:
+        return VALID_WORKSPACE_MODULES
+    raw_tokens: list[str] = []
+    if isinstance(modules, str):
+        raw_tokens.extend(modules.split(","))
+    else:
+        for item in modules:
+            raw_tokens.extend(item.split(","))
+    cleaned = [t.strip().lower() for t in raw_tokens if t.strip()]
+    if not cleaned or "all" in cleaned:
+        return VALID_WORKSPACE_MODULES
+    unknown = [t for t in cleaned if t not in VALID_WORKSPACE_MODULES]
+    if unknown:
+        msg = (
+            f"Unknown workspace module(s): {', '.join(unknown)}. "
+            f"Choose from {', '.join(VALID_WORKSPACE_MODULES)} or all."
+        )
+        raise ValueError(msg)
+    return tuple(m for m in VALID_WORKSPACE_MODULES if m in cleaned)
+
+
+def subdirs_for_modules(modules: Sequence[str]) -> tuple[str, ...]:
+    """Return deduplicated directory list for the requested workspace modules."""
+    ordered: list[str] = []
+    for mod in modules:
+        for rel in _MODULE_SUBDIRS.get(mod, ()):
+            if rel not in ordered:
+                ordered.append(rel)
+    for rel in _BASE_SUBDIRS:
+        if rel not in ordered:
+            ordered.append(rel)
+    return tuple(ordered)
 
 _SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 _TOKEN_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,47}$")
@@ -130,20 +198,32 @@ def init_workspace(
     *,
     root: Path | None = None,
     flow_project_id: str | None = None,
+    modules: Sequence[str] | str | None = None,
 ) -> dict[str, Any]:
-    """Create the standard project workspace tree and ``project.json``."""
+    """Create the project workspace tree (all or selected modules) and ``project.json``."""
     clean_slug = validate_slug(slug)
+    resolved_modules = parse_workspace_modules(modules)
     base_root = (root or Path.cwd() / "projects").expanduser().resolve()
     project_dir = base_root / clean_slug
     project_dir.mkdir(parents=True, exist_ok=True)
-    for rel in WORKSPACE_SUBDIRS:
+    for rel in subdirs_for_modules(resolved_modules):
         (project_dir / rel).mkdir(parents=True, exist_ok=True)
 
     mpath = manifest_path(project_dir)
     if mpath.is_file():
         manifest = load_manifest(project_dir)
+        changed = False
         if flow_project_id is not None:
             manifest["flow_project_id"] = flow_project_id
+            changed = True
+        if modules is not None:
+            existing_mods = list(manifest.get("modules") or [])
+            merged = [
+                m for m in VALID_WORKSPACE_MODULES if m in existing_mods or m in resolved_modules
+            ]
+            manifest["modules"] = merged
+            changed = True
+        if changed:
             save_manifest(project_dir, manifest)
         return {
             "status": "existing",
@@ -151,12 +231,14 @@ def init_workspace(
             "project_dir": str(project_dir),
             "manifest_path": str(mpath),
             "flow_project_id": manifest.get("flow_project_id"),
+            "modules": list(manifest.get("modules") or VALID_WORKSPACE_MODULES),
         }
 
     now = datetime.now(UTC).isoformat()
     manifest: dict[str, Any] = {
         "schema_version": WORKSPACE_SCHEMA_VERSION,
         "slug": clean_slug,
+        "modules": list(resolved_modules),
         "flow_project_id": flow_project_id,
         "created_at": now,
         "updated_at": now,
@@ -165,13 +247,19 @@ def init_workspace(
         "assets": {},
     }
     save_manifest(project_dir, manifest)
-    log.info("workspace.initialized", slug=clean_slug, project_dir=str(project_dir))
+    log.info(
+        "workspace.initialized",
+        slug=clean_slug,
+        modules=list(resolved_modules),
+        project_dir=str(project_dir),
+    )
     return {
         "status": "created",
         "slug": clean_slug,
         "project_dir": str(project_dir),
         "manifest_path": str(mpath),
         "flow_project_id": flow_project_id,
+        "modules": list(resolved_modules),
     }
 
 
@@ -357,10 +445,13 @@ def workspace_status(project_dir: Path) -> dict[str, Any]:
         ("images/candidates", "candidate"),
         ("videos/drafts", "candidate"),
         ("videos/masters", "candidate"),
+        ("audio/music", "candidate"),
         ("images/approved", "approved"),
         ("videos/approved", "approved"),
+        ("audio/approved", "approved"),
         ("images/rejected", "rejected"),
         ("videos/rejected", "rejected"),
+        ("audio/rejected", "rejected"),
     )
     for rel_dir, bucket in dir_mapping:
         for rel_file in _scan_dir_files(root, rel_dir):
@@ -373,6 +464,7 @@ def workspace_status(project_dir: Path) -> dict[str, Any]:
     return {
         "slug": manifest["slug"],
         "project_dir": str(root),
+        "modules": list(manifest.get("modules") or VALID_WORKSPACE_MODULES),
         "flow_project_id": manifest.get("flow_project_id"),
         "ingredients_count": len(manifest.get("ingredients", [])),
         "upload_cache_count": cached_count,

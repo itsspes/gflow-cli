@@ -59,12 +59,23 @@ def _emit(result: Any, *, as_json: bool, output_format: str) -> None:
 @click.command("transcribe")
 @click.argument("file")
 @out_file_option(help="Explicit output .srt file path (defaults to <name>.srt).")
+@click.option(
+    "--backend",
+    type=click.Choice(["auto", "mlx", "faster_whisper", "remote"], case_sensitive=False),
+    default="remote",
+    show_default=True,
+    help=(
+        "Transcription backend: 'remote' uses the configured OpenAI-compatible Whisper endpoint; "
+        "'mlx', 'faster_whisper', or 'auto' runs local Apple Silicon / CPU Whisper."
+    ),
+)
 @click.option("--language", default=None, help="ISO-639-1 language hint for transcription.")
 @click.option("--profile", default=None, help="Profile name when FILE is a catalog media UUID.")
 @output_format_option(has_out_file=True)
 def transcribe(
     file: str,
     output_file: Path | None,
+    backend: str,
     language: str | None,
     profile: str | None,
     as_json: bool,
@@ -75,6 +86,34 @@ def transcribe(
 
     async def execute() -> None:
         reject_explicit_out_file_under_cloud_storage(output_file)
+        chosen = backend.lower()
+        if chosen in ("auto", "mlx", "faster_whisper"):
+            import importlib
+
+            lw = importlib.import_module("gflow_cli.services.local_whisper")
+            tr_fn: Any = lw.transcribe_local
+            media_path = Path(file).expanduser()
+            srt_dest = output_file or media_path.with_suffix(".srt")
+            local_res: Any = await asyncio.to_thread(
+                tr_fn,
+                media_path,
+                backend=chosen,
+                language=language,
+                out_srt=srt_dest,
+            )
+            payload = local_res.to_dict() if hasattr(local_res, "to_dict") else dict(local_res)
+            if output_format == OutputFormat.ID.value:
+                click.echo(str(payload.get("srt_path") or srt_dest))
+            elif is_json:
+                json_output.emit(payload)
+            else:
+                table = Table(title=f"Local transcription ({payload.get('backend', chosen)})")
+                table.add_row("Source", escape(str(payload.get("source", file))))
+                table.add_row("Model", escape(str(payload.get("model", ""))))
+                table.add_row("SRT", escape(str(payload.get("srt_path") or srt_dest)))
+                table.add_row("Text", escape(str(payload.get("text", ""))[:200]))
+                console.print(table)
+            return
         result = await asyncio.to_thread(
             transcribe_video, file, out_file=output_file, language=language, profile=profile
         )

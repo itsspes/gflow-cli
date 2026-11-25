@@ -39,24 +39,33 @@ def workspace() -> None:
     help="Parent directory for projects (default: ./projects).",
 )
 @click.option("--flow-project", "flow_project_id", default=None, help="Associated Flow project ID.")
+@click.option(
+    "--modules",
+    default="all",
+    show_default=True,
+    help="Comma-separated modalities to scaffold: image, video, music, or all.",
+)
 @output_format_option(allow_id=False)
 def workspace_init(
     slug: str,
     root: Path | None,
     flow_project_id: str | None,
+    modules: str,
     as_json: bool,
     output_format: str = "table",
 ) -> None:
-    """Initialize a project workspace tree and project.json."""
+    """Initialize a modular project workspace tree and project.json."""
     try:
-        payload = init_workspace(slug, root=root, flow_project_id=flow_project_id)
+        payload = init_workspace(slug, root=root, flow_project_id=flow_project_id, modules=modules)
     except ValueError as exc:
         raise click.UsageError(str(exc)) from exc
     if as_json or output_format == OutputFormat.JSON.value:
         json_output.emit(payload)
         return
+    mods = ",".join(payload.get("modules", []))
     console.print(
-        f"Workspace [bold]{payload['slug']}[/bold] ({payload['status']}): {payload['project_dir']}"
+        f"Workspace [bold]{payload['slug']}[/bold] ({payload['status']}, modules={mods}): "
+        f"{payload['project_dir']}"
     )
 
 
@@ -83,7 +92,7 @@ def workspace_status_cmd(
     if as_json or output_format == OutputFormat.JSON.value:
         json_output.emit(payload)
         return
-    table = Table(title=f"Workspace: {payload['slug']}")
+    table = Table(title=f"Workspace: {payload['slug']} ({', '.join(payload.get('modules', []))})")
     table.add_column("Bucket", style="bold")
     table.add_column("Count", justify="right")
     for bucket, count in payload["counts"].items():

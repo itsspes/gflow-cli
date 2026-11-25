@@ -153,6 +153,10 @@ chain = [
     "pillow>=13.0.0",
 ]
 tts = ["edge-tts>=7.3.1"]
+# Local Apple Silicon M4 transcription extra (no-op marker on Linux/Windows CI).
+mlx = [
+    'mlx-whisper>=0.4.0; sys_platform == "darwin" and platform_machine == "arm64"',
+]
 # Patchright engine extra — opt-in, drop-in patched Playwright (Chromium) that
 # avoids the Runtime.enable CDP leak on the headed path. Selected via
 # GFLOW_CLI_BROWSER_ENGINE=patchright. Ships a PATCHED Chromium driver that

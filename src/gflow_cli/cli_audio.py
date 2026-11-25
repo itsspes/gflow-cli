@@ -1,4 +1,4 @@
-"""Local speech synthesis, FlowMusic beat analysis, and audio mastering commands."""
+"""Local speech synthesis, FlowMusic analysis/mastering, local Whisper, and audio QA commands."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ import asyncio
 from pathlib import Path
 
 import click
+from rich.console import Console
 
 from gflow_cli import json_output
 from gflow_cli._cli_helpers import (
@@ -22,6 +23,10 @@ from gflow_cli.services.audio_mastering import (
     master_audio,
 )
 from gflow_cli.services.audio_narration import Provider, narrate
+from gflow_cli.services.local_whisper import VALID_LOCAL_BACKENDS, transcribe_local
+from gflow_cli.services.quality_gate import run_qa_check
+
+console = Console()
 
 
 def _parse_shot_durations(raw: str | None) -> tuple[float, ...]:
@@ -48,7 +53,7 @@ def _parse_shot_durations(raw: str | None) -> tuple[float, ...]:
 
 @click.group()
 def audio() -> None:
-    """Create narration, analyze FlowMusic beats/loudness, and master audio locally."""
+    """Create narration, analyze/master FlowMusic, transcribe locally, and run audio QA."""
 
 
 @spends_credits(False)
@@ -330,3 +335,153 @@ def master_command(
     run_with_handlers(
         execute, cli_command="audio master", as_json=is_json, output_format=output_format
     )
+
+
+@spends_credits(False)
+@audio.command(
+    "transcribe",
+    short_help="Transcribe local audio or video using M4 MLX Whisper or faster-whisper.",
+)
+@click.argument("media_file", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option(
+    "--backend",
+    type=click.Choice(VALID_LOCAL_BACKENDS, case_sensitive=False),
+    default="auto",
+    show_default=True,
+    help="Local Whisper backend (auto prefers MLX on Apple Silicon, then faster-whisper).",
+)
+@click.option(
+    "--model",
+    default=None,
+    help="Model ID/path (defaults to mlx-community/whisper-small-mlx or base).",
+)
+@click.option("--language", default=None, help="Optional ISO-639-1 language hint (e.g. en, de).")
+@click.option(
+    "--word-timestamps/--no-word-timestamps",
+    default=True,
+    show_default=True,
+    help="Include word-level start/end timestamps in segments.",
+)
+@click.option(
+    "--out-srt",
+    type=click.Path(dir_okay=False, path_type=Path),
+    default=None,
+    help="Write SubRip (.srt) subtitle file here.",
+)
+@click.option(
+    "--out-json",
+    type=click.Path(dir_okay=False, path_type=Path),
+    default=None,
+    help="Write full structured transcript JSON (including word timestamps) here.",
+)
+@click.option(
+    "--project-dir",
+    type=click.Path(file_okay=False, path_type=Path),
+    default=None,
+    help="Optional project workspace (auto-routes SRT/JSON under audio/analysis/ if omitted).",
+)
+@output_format_option(has_out_file=False)
+def transcribe_command(
+    media_file: Path,
+    backend: str,
+    model: str | None,
+    language: str | None,
+    word_timestamps: bool,
+    out_srt: Path | None,
+    out_json: Path | None,
+    project_dir: Path | None,
+    as_json: bool,
+    output_format: str = "table",
+) -> None:
+    """Transcribe local audio or video MEDIA_FILE with zero cloud/Flow credits.
+
+    Works standalone without --project-dir. Accepts WAV, MP3, M4A, FLAC, OGG, MP4, MOV, or WebM.
+    """
+    is_json = as_json or output_format == OutputFormat.JSON.value
+    src = media_file.expanduser()
+    resolved_srt = out_srt.expanduser() if out_srt is not None else None
+    resolved_json = out_json.expanduser() if out_json is not None else None
+    if project_dir is not None and resolved_srt is None and resolved_json is None:
+        analysis_dir = project_dir.expanduser().resolve() / "audio" / "analysis"
+        resolved_srt = analysis_dir / f"{src.stem}.srt"
+        resolved_json = analysis_dir / f"{src.stem}_transcript.json"
+
+    async def execute() -> None:
+        result = await asyncio.to_thread(
+            transcribe_local,
+            src,
+            backend=backend.lower(),
+            model=model,
+            language=language,
+            word_timestamps=word_timestamps,
+            out_srt=resolved_srt,
+            out_json=resolved_json,
+        )
+        if output_format == OutputFormat.ID.value:
+            click.echo(result.srt_path or result.json_path or result.source)
+        elif is_json:
+            json_output.emit(result.to_dict())
+        else:
+            saved = [str(p) for p in (result.srt_path, result.json_path) if p is not None]
+            saved_note = f" -> {', '.join(saved)}" if saved else ""
+            preview = result.text[:120] + ("..." if len(result.text) > 120 else "")
+            click.echo(
+                f"Transcribed {Path(result.source).name} via {result.backend} "
+                f"({result.model}, {len(result.segments)} segments){saved_note}: {preview}"
+            )
+
+    run_with_handlers(
+        execute, cli_command="audio transcribe", as_json=is_json, output_format=output_format
+    )
+
+
+@spends_credits(False)
+@audio.command(
+    "qa",
+    short_help="Run standalone Stage-1 technical QA checks on an audio/music file.",
+)
+@click.argument("audio_file", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option(
+    "--project-dir",
+    type=click.Path(file_okay=False, path_type=Path),
+    default=None,
+    help="Optional project workspace (writes review.json into qa/reviews/ when given).",
+)
+@click.option("--target-duration", type=float, default=None, help="Expected duration in seconds.")
+@click.option("--target-bpm", type=float, default=None, help="Expected music tempo in BPM.")
+@output_format_option(allow_id=False)
+def qa_command(
+    audio_file: Path,
+    project_dir: Path | None,
+    target_duration: float | None,
+    target_bpm: float | None,
+    as_json: bool,
+    output_format: str = "table",
+) -> None:
+    """Run deterministic Stage-1 audio QA checks on AUDIO_FILE (no Flow credits).
+
+    Works standalone without --project-dir or any image/video project files.
+    """
+    try:
+        payload = run_qa_check(
+            audio_file.expanduser(),
+            kind="audio",
+            project_dir=project_dir.expanduser() if project_dir is not None else None,
+            target_duration=target_duration,
+            target_bpm=target_bpm,
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    if as_json or output_format == OutputFormat.JSON.value:
+        json_output.emit(payload)
+        return
+    verdict = payload["verdict"]
+    color = {"PASS_TECH": "green", "NEEDS_MINOR_EDIT": "yellow", "FAIL_TECH": "red"}.get(
+        verdict, "white"
+    )
+    console.print(f"[{color}]{verdict}[/{color}] (audio): {payload['file']}")
+    for issue in payload.get("issues", []):
+        console.print(f"  - [{issue['severity']}] {issue['code']}: {issue['detail']}")
+    for action in payload.get("next_actions", []):
+        console.print(f"  -> {action}")

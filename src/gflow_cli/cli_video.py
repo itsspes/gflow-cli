@@ -1295,6 +1295,92 @@ def assemble(
     )
 
 
+@spends_credits(False)
+@video.command("qa", short_help="Run deterministic Stage-1 QA checks on a video (credit-free).")
+@click.argument("video_file", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option(
+    "--project-dir",
+    type=click.Path(file_okay=False, path_type=Path),
+    default=None,
+    help=(
+        "Optional project workspace directory "
+        "(writes review.json & 1 fps strip into qa/reviews/)."
+    ),
+)
+@click.option("--target-duration", type=float, default=None, help="Expected duration in seconds.")
+@click.option(
+    "--transcribe",
+    "run_transcribe",
+    is_flag=True,
+    default=False,
+    help="Also run local Whisper transcription and attach transcript summary.",
+)
+@click.option(
+    "--whisper-backend",
+    type=click.Choice(["auto", "mlx", "faster_whisper"], case_sensitive=False),
+    default="auto",
+    show_default=True,
+    help="Local transcription backend used when --transcribe is set.",
+)
+@click.option("--language", default=None, help="Optional ISO-639-1 language hint for --transcribe.")
+@output_format_option(allow_id=False)
+def video_qa(
+    video_file: Path,
+    project_dir: Path | None,
+    target_duration: float | None,
+    run_transcribe: bool,
+    whisper_backend: str,
+    language: str | None,
+    as_json: bool,
+    output_format: str = "table",
+) -> None:
+    """Run deterministic ffprobe, 1 fps contact strip, and audio hygiene QA on VIDEO_FILE."""
+    import asyncio
+    import importlib
+
+    from gflow_cli.services.quality_gate import run_qa_check
+
+    is_json = as_json or output_format == OutputFormat.JSON.value
+
+    async def _run() -> None:
+        payload = run_qa_check(
+            video_file,
+            kind="video",
+            project_dir=project_dir,
+            target_duration=target_duration,
+        )
+        if run_transcribe:
+            lw = importlib.import_module("gflow_cli.services.local_whisper")
+            tr_fn: Any = lw.transcribe_local
+            tr_res: Any = await asyncio.to_thread(
+                tr_fn,
+                video_file,
+                backend=whisper_backend.lower(),
+                language=language,
+            )
+            payload["transcript"] = tr_res.to_dict() if hasattr(tr_res, "to_dict") else tr_res
+        if is_json:
+            json_output.emit(payload)
+            return
+        verdict = payload["verdict"]
+        color = {"PASS_TECH": "green", "NEEDS_MINOR_EDIT": "yellow", "FAIL_TECH": "red"}.get(
+            verdict, "white"
+        )
+        console.print(f"[{color}]{verdict}[/{color}] (video): {payload['file']}")
+        for issue in payload.get("issues", []):
+            console.print(f"  - [{issue['severity']}] {issue['code']}: {issue['detail']}")
+        if "transcript" in payload:
+            text_preview = str(payload["transcript"].get("text", ""))[:120]
+            console.print(f"  transcript: {text_preview}")
+
+    run_with_handlers(
+        _run,
+        cli_command="video qa",
+        as_json=is_json,
+        output_format=output_format,
+    )
+
+
 @spends_credits(True)
 @video.command(
     "t2v",

@@ -238,6 +238,7 @@ def _register_surfaces() -> None:
     from gflow_cli.mcp import media_trash_tools as _media_trash_tools
     from gflow_cli.mcp import music_tools as _music_tools
     from gflow_cli.mcp import prompts as _prompts
+    from gflow_cli.mcp import qa_audio_tools as _qa_audio_tools
     from gflow_cli.mcp import resources as _resources
     from gflow_cli.mcp import tools as _tools
     from gflow_cli.mcp import video_captions_tools as _video_captions_tools
@@ -251,6 +252,7 @@ def _register_surfaces() -> None:
         _media_trash_tools,
         _music_tools,
         _prompts,
+        _qa_audio_tools,
         _resources,
         _tools,
         _video_captions_tools,

@@ -1970,3 +1970,39 @@ def _print_i2i_summary(images: list[GeneratedImage], saved_paths: list[Path]) ->
         w, h = img.dimensions
         table.add_row(img.media_name, str(img.seed), f"{w}x{h}", safe_path_text(path))
     console.print(table)
+
+
+@spends_credits(False)
+@image.command("qa", short_help="Run deterministic Stage-1 QA checks on an image (credit-free).")
+@click.argument("image_file", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option(
+    "--project-dir",
+    type=click.Path(file_okay=False, path_type=Path),
+    default=None,
+    help="Optional project workspace directory (writes review.json into qa/reviews/).",
+)
+@output_format_option(allow_id=False)
+def image_qa(
+    image_file: Path,
+    project_dir: Path | None,
+    as_json: bool,
+    output_format: str = "table",
+) -> None:
+    """Run deterministic readability, sharpness, and blank-frame QA on IMAGE_FILE."""
+    from gflow_cli.services.quality_gate import run_qa_check
+
+    try:
+        payload = run_qa_check(image_file, kind="image", project_dir=project_dir)
+    except (FileNotFoundError, ValueError) as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    if as_json or output_format == OutputFormat.JSON.value:
+        json_output.emit(payload)
+        return
+    verdict = payload["verdict"]
+    color = {"PASS_TECH": "green", "NEEDS_MINOR_EDIT": "yellow", "FAIL_TECH": "red"}.get(
+        verdict, "white"
+    )
+    console.print(f"[{color}]{verdict}[/{color}] (image): {payload['file']}")
+    for issue in payload.get("issues", []):
+        console.print(f"  - [{issue['severity']}] {issue['code']}: {issue['detail']}")
