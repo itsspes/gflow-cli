@@ -161,6 +161,9 @@ _SPEND_TOOLS = (
     "gflow_upscale_video",
     "gflow_extend_video",
     "gflow_edit_video",
+    "gflow_music_compose",
+    "gflow_music_chat",
+    "gflow_music_generate",
 )
 
 
@@ -233,6 +236,7 @@ def _register_surfaces() -> None:
     from gflow_cli.mcp import audio_tools as _audio_tools
     from gflow_cli.mcp import character_tools as _character_tools
     from gflow_cli.mcp import media_trash_tools as _media_trash_tools
+    from gflow_cli.mcp import music_tools as _music_tools
     from gflow_cli.mcp import prompts as _prompts
     from gflow_cli.mcp import resources as _resources
     from gflow_cli.mcp import tools as _tools
@@ -245,6 +249,7 @@ def _register_surfaces() -> None:
         _audio_tools,
         _character_tools,
         _media_trash_tools,
+        _music_tools,
         _prompts,
         _resources,
         _tools,
