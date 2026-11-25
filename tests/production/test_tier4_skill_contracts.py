@@ -59,7 +59,15 @@ def _parse_frontmatter(text: str) -> dict[str, str]:
 
 def test_umbrella_skills_exist() -> None:
     files = _umbrella_skill_files()
-    assert len(files) >= 1, f"Expected at least one umbrella skill under {_UMBRELLA_SKILLS_DIR}"
+    names = {p.parent.name for p in files}
+    expected = {
+        "mv-flow-prompting",
+        "mv-flowmusic-sync",
+        "mv-quality-gate",
+        "mv-project-workspace",
+    }
+    missing = expected - names
+    assert not missing, f"Missing expected umbrella skills under {_UMBRELLA_SKILLS_DIR}: {missing}"
 
 
 @pytest.mark.parametrize(
