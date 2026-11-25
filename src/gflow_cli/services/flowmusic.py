@@ -17,7 +17,8 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
+from urllib.parse import urlparse
 
 import structlog
 from playwright.async_api import BrowserContext, Page, Response, async_playwright
@@ -44,6 +45,8 @@ log = structlog.get_logger(__name__)
 
 FLOWMUSIC_URL = "https://www.flowmusic.app/"
 FLOWMUSIC_SESSION_URL = "https://www.flowmusic.app/session?t=true"
+FLOWMUSIC_ME_URL = "https://www.flowmusic.app/__api/users/me"
+_FLOWMUSIC_HOSTS = frozenset({"www.flowmusic.app", "flowmusic.app"})
 
 PROMPT_SELECTOR = 'textarea[aria-label="Chat message"]'
 SEND_BUTTON_SELECTOR = 'button[aria-label="Send message"]'
@@ -121,6 +124,7 @@ class FlowMusicAuthResult:
     auth_prompt_visible: bool
     composer_visible: bool
     detail: str = ""
+    account: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -130,6 +134,7 @@ class FlowMusicAuthResult:
             "profile_dir": self.profile_dir,
             "auth_prompt_visible": self.auth_prompt_visible,
             "composer_visible": self.composer_visible,
+            "account": self.account,
             "detail": self.detail,
         }
 
@@ -252,6 +257,8 @@ async def _open_flowmusic_page(
         ]
         if background:
             args.extend(window_position_args(cfg.browser_window_position))
+        else:
+            args.append("--window-position=0,0")
         launch_kwargs: dict[str, Any] = {
             "user_data_dir": str(resolved_dir),
             "headless": False,
@@ -290,8 +297,37 @@ async def _open_flowmusic_page(
         lease.release()
 
 
-async def _inspect_auth_state(page: Page) -> tuple[bool, bool, bool]:
-    """Return ``(signed_in, auth_prompt_visible, composer_visible)``."""
+async def _fetch_flowmusic_me(page: Page) -> dict[str, Any] | None:
+    """Query Flow Music's canonical session endpoint; return user dict when signed in."""
+    try:
+        resp = await page.request.get(FLOWMUSIC_ME_URL, timeout=10_000)
+        if resp.status != 200:
+            return None
+        data: Any = await resp.json()
+        if isinstance(data, dict) and data:
+            return cast("dict[str, Any]", data)
+    except Exception:
+        return None
+    return None
+
+
+def _extract_account_label(me: dict[str, Any] | None) -> str | None:
+    """Extract a safe display identifier from the ``/__api/users/me`` payload."""
+    if not me:
+        return None
+    for key in ("email", "handle", "username", "displayName", "name", "id"):
+        val = me.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    return None
+
+
+async def _inspect_auth_state(page: Page) -> tuple[bool, bool, bool, str | None]:
+    """Return ``(signed_in, auth_prompt_visible, composer_visible, account)``."""
+    host = (urlparse(page.url).hostname or "").lower()
+    if host not in _FLOWMUSIC_HOSTS:
+        return False, False, False, None
+
     auth_prompt_visible = False
     for label in _AUTH_BUTTON_TEXTS:
         try:
@@ -308,8 +344,10 @@ async def _inspect_auth_state(page: Page) -> tuple[bool, bool, bool]:
     except Exception:
         composer_visible = False
 
-    signed_in = not auth_prompt_visible
-    return signed_in, auth_prompt_visible, composer_visible
+    me = await _fetch_flowmusic_me(page)
+    account = _extract_account_label(me)
+    signed_in = me is not None and not auth_prompt_visible
+    return signed_in, auth_prompt_visible, composer_visible, account
 
 
 async def login_flowmusic(
@@ -325,9 +363,11 @@ async def login_flowmusic(
         signed_in = False
         auth_prompt = True
         composer = False
+        account: str | None = None
         while time.monotonic() < deadline:
-            signed_in, auth_prompt, composer = await _inspect_auth_state(page)
+            signed_in, auth_prompt, composer, account = await _inspect_auth_state(page)
             if signed_in:
+                await page.wait_for_timeout(1_500)
                 break
             await asyncio.sleep(1.0)
         return FlowMusicAuthResult(
@@ -336,6 +376,7 @@ async def login_flowmusic(
             profile_dir=str(profile_dir),
             auth_prompt_visible=auth_prompt,
             composer_visible=composer,
+            account=account,
             detail=(
                 "Signed in to Google Flow Music."
                 if signed_in
@@ -353,13 +394,14 @@ async def check_flowmusic_status(
     async with _open_flowmusic_page(profile_dir, background=True, settings=settings) as page:
         await page.goto(FLOWMUSIC_URL, wait_until="domcontentloaded", timeout=45_000)
         await page.wait_for_timeout(1_500)
-        signed_in, auth_prompt, composer = await _inspect_auth_state(page)
+        signed_in, auth_prompt, composer, account = await _inspect_auth_state(page)
         return FlowMusicAuthResult(
             signed_in=signed_in,
             url=page.url,
             profile_dir=str(profile_dir),
             auth_prompt_visible=auth_prompt,
             composer_visible=composer,
+            account=account,
             detail="Signed in." if signed_in else "Not signed in. Run: gflow music login",
         )
 
@@ -389,13 +431,14 @@ async def probe_flowmusic_ui(
         page.on("response", _on_response)
         await page.goto(url, wait_until="domcontentloaded", timeout=45_000)
         await page.wait_for_timeout(2_500)
-        signed_in, auth_prompt, composer = await _inspect_auth_state(page)
+        signed_in, auth_prompt, composer, account = await _inspect_auth_state(page)
         controls: list[dict[str, Any]] = await page.evaluate(_PROBE_CONTROLS_JS)
         return {
             "url": page.url,
             "signed_in": signed_in,
             "auth_prompt_visible": auth_prompt,
             "composer_visible": composer,
+            "account": account,
             "controls_count": len(controls),
             "controls": controls,
             "observed_urls": observed_urls,
@@ -587,7 +630,7 @@ async def generate_flowmusic(
         await page.goto(FLOWMUSIC_SESSION_URL, wait_until="domcontentloaded", timeout=45_000)
         await page.wait_for_timeout(1_500)
 
-        signed_in, auth_prompt, _composer = await _inspect_auth_state(page)
+        signed_in, auth_prompt, _composer, _account = await _inspect_auth_state(page)
         if not signed_in or auth_prompt:
             raise FlowMusicAuthError(
                 detail="Not signed in to Google Flow Music.",

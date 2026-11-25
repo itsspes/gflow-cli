@@ -64,7 +64,8 @@ def music_login(
         if is_json:
             json_output.emit(result.to_dict())
         elif result.signed_in:
-            console.print(f"[green]Signed in[/green] to Google Flow Music ({result.url}).")
+            acct = f" as {result.account}" if result.account else ""
+            console.print(f"[green]Signed in[/green] to Google Flow Music{acct} ({result.url}).")
         else:
             console.print(f"[yellow]{result.detail}[/yellow]")
 
@@ -93,7 +94,8 @@ def music_status(
         if is_json:
             json_output.emit(result.to_dict())
         elif result.signed_in:
-            console.print(f"Flow Music: [green]signed in[/green] ({result.url})")
+            acct = f" as {result.account}" if result.account else ""
+            console.print(f"Flow Music: [green]signed in[/green]{acct} ({result.url})")
         else:
             console.print("Flow Music: [yellow]signed out[/yellow] — run `gflow music login`.")
 
