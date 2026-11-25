@@ -700,6 +700,19 @@ class FlowMusicClient:
         except Exception:
             return
 
+    async def _fetch_current_clip_ids(self, *, limit: int = 20) -> set[str]:
+        """Fetch existing clip IDs via in-page ``/__api/clips/auth-user`` without navigating."""
+        api_url = (
+            f"/__api/clips/auth-user?limit={limit}&offset=0"
+            "&filter=generations&include_disliked=false"
+        )
+        raw = await self._in_page_get_json(api_url)
+        return {
+            c.id
+            for c in (FlowMusicClip.from_api(i) for i in _extract_items_list(raw, ("clips",)))
+            if c.id
+        }
+
     async def compose(
         self,
         sound_description: str,
@@ -713,8 +726,7 @@ class FlowMusicClient:
     ) -> tuple[CapturedAudioPayload, str | None]:
         """Drive Compose mode on ``/session?t=true`` and return the downloaded clip payload."""
         await self.ensure_authenticated(url=FLOWMUSIC_SESSION_URL)
-        pre_clips = await self.list_clips(limit=20, offset=0)
-        existing_ids = {c.id for c in pre_clips if c.id}
+        existing_ids = await self._fetch_current_clip_ids(limit=20)
         self._captured_audio.clear()
 
         sound_box = self.page.locator(SOUND_DESC_SELECTOR).first
@@ -769,8 +781,9 @@ class FlowMusicClient:
             else FLOWMUSIC_SESSION_URL
         )
         await self.ensure_authenticated(url=target_url)
-        pre_clips = await self.list_clips(limit=20, offset=0) if wait_clip else []
-        existing_ids = {c.id for c in pre_clips if c.id}
+        existing_ids: set[str] = (
+            await self._fetch_current_clip_ids(limit=20) if wait_clip else set()
+        )
         self._captured_audio.clear()
 
         if ref_audio is not None:
