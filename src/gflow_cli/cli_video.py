@@ -144,6 +144,76 @@ _resolution_option = click.option(
     ),
 )
 
+
+def _draft_options(fn: Any) -> Any:
+    """Attach credit-saving ``--draft``, ``--project-dir``, and ``--shot`` options."""
+    fn = click.option(
+        "--shot",
+        default="s01",
+        show_default=True,
+        help="Shot identifier used for deterministic project-dir draft naming (e.g. s01).",
+    )(fn)
+    fn = click.option(
+        "--project-dir",
+        type=click.Path(file_okay=False, path_type=Path),
+        default=None,
+        help="Project workspace directory; with --draft, auto-routes output into videos/drafts/.",
+    )(fn)
+    fn = click.option(
+        "--draft",
+        is_flag=True,
+        default=False,
+        help=(
+            "Credit-saving draft preset: defaults --model to omni-1.2 and --resolution to 360p "
+            "(unless overridden). With --project-dir, writes to "
+            "videos/drafts/<slug>_<shot>_draft_vNN.mp4."
+        ),
+    )(fn)
+    return fn
+
+
+def resolve_draft_preset(
+    *,
+    draft: bool,
+    model: str | None,
+    resolution: str | None,
+    project_dir: Path | None,
+    shot: str,
+    output_file: Path | None,
+    quiet: bool = False,
+) -> tuple[str | None, str | None, Path | None]:
+    """Apply ``--draft`` defaults and optional workspace draft routing."""
+    if not draft:
+        return model, resolution, output_file
+    resolved_model = model or "omni-1.2"
+    resolved_resolution = resolution or "360p"
+    resolved_output = output_file
+    if project_dir is not None and resolved_output is None:
+        from gflow_cli.services.project_workspace import load_manifest, next_asset_path
+
+        root = project_dir.expanduser().resolve()
+        manifest = load_manifest(root)
+        drafts_dir = root / "videos" / "drafts"
+        drafts_dir.mkdir(parents=True, exist_ok=True)
+        resolved_output = next_asset_path(
+            drafts_dir,
+            slug=str(manifest["slug"]),
+            shot=shot,
+            kind="draft",
+            ext="mp4",
+        )
+    if not quiet:
+        dest_hint = f" -> {resolved_output}" if resolved_output is not None else ""
+        click.secho(
+            f"[draft] model={resolved_model}, resolution={resolved_resolution}{dest_hint}. "
+            "Once approved via `gflow qa check/decide`, promote with --resolution 720p or "
+            "`gflow video upscale`.",
+            err=True,
+            fg="cyan",
+        )
+    return resolved_model, resolved_resolution, resolved_output
+
+
 _max_credits_option = click.option(
     "--max-credits",
     type=click.IntRange(min=0),
@@ -1291,6 +1361,7 @@ def assemble(
 # guard rejects reference entities — see _shared_gen_tail_options.
 @_reference_entity_option
 @_reference_entity_name_option
+@_draft_options
 @_shared_gen_tail_options
 def t2v(
     prompt: str,
@@ -1300,6 +1371,9 @@ def t2v(
     resolution: str | None,
     count: int,
     ui_mode: str | None,
+    draft: bool,
+    project_dir: Path | None,
+    shot: str,
     max_credits: int | None,
     profile: str | None,
     tool_specs: tuple[str, ...],
@@ -1313,12 +1387,21 @@ def t2v(
     output_format: str = "table",
 ) -> None:
     """Generate a video from PROMPT."""
+    is_json = as_json or output_format == OutputFormat.JSON.value
+    model, resolution, output_file = resolve_draft_preset(
+        draft=draft,
+        model=model,
+        resolution=resolution,
+        project_dir=project_dir,
+        shot=shot,
+        output_file=output_file,
+        quiet=is_json or output_format == OutputFormat.ID.value,
+    )
     _reject_agentic_ui_mode(ui_mode)
     _reject_duration_without_control(model, duration)
     profile_name = _resolve_profile(profile)
     project_id = default_project(project_id, project_name, profile_name)
     provider_dir = _make_provider_dir(profile_name)
-    is_json = as_json or output_format == OutputFormat.JSON.value
     run_with_handlers(
         lambda: _run_t2v(
             profile_name=profile_name,
@@ -1494,6 +1577,7 @@ def _classify_frame(value: str | None, param_hint: str) -> tuple[str | None, str
     help="How many videos to generate (1-4; >1 multiplies credit cost).",
 )
 @_ui_mode_option
+@_draft_options
 @_shared_gen_tail_options
 def i2v(  # NOSONAR
     image: str | None,
@@ -1507,6 +1591,9 @@ def i2v(  # NOSONAR
     resolution: str | None,
     count: int,
     ui_mode: str | None,
+    draft: bool,
+    project_dir: Path | None,
+    shot: str,
     max_credits: int | None,
     profile: str | None,
     tool_specs: tuple[str, ...],
@@ -1518,6 +1605,17 @@ def i2v(  # NOSONAR
     output_format: str = "table",
 ) -> None:
     """Generate a video from an initial frame + motion PROMPT."""
+    is_json = as_json or output_format == OutputFormat.JSON.value
+    quiet_output = is_json or output_format == OutputFormat.ID.value
+    model, resolution, output_file = resolve_draft_preset(
+        draft=draft,
+        model=model,
+        resolution=resolution,
+        project_dir=project_dir,
+        shot=shot,
+        output_file=output_file,
+        quiet=quiet_output,
+    )
     _reject_agentic_ui_mode(ui_mode)
     # i2v binds I2V_DEFAULT_MODEL when --model is omitted, so the guard needs
     # that default to fire on the no-flag path (#630).
@@ -1682,6 +1780,7 @@ def i2v(  # NOSONAR
 )
 @_max_credits_option
 @no_max_credits_option
+@_draft_options
 @output_format_option(has_out_file=True)
 def r2v(
     prompt: str,
@@ -1698,12 +1797,25 @@ def r2v(
     reference_entities: tuple[str, ...],
     reference_entity_names: tuple[str, ...],
     max_credits: int | None,
+    draft: bool,
+    project_dir: Path | None,
+    shot: str,
     output_file: Path | None,
     out_dir: Path | None,
     as_json: bool,
     output_format: str = "table",
 ) -> None:
     """Generate a video from reference images (--ref) + PROMPT."""
+    is_json = as_json or output_format == OutputFormat.JSON.value
+    model, resolution, output_file = resolve_draft_preset(
+        draft=draft,
+        model=model,
+        resolution=resolution,
+        project_dir=project_dir,
+        shot=shot,
+        output_file=output_file,
+        quiet=is_json or output_format == OutputFormat.ID.value,
+    )
     # Reject over-cap ref counts (and the unsupported model+R2V combo) at the
     # CLI boundary with a clear message (exit 2) rather than letting the domain
     # ValueError surface as a generic error. GenerateVideoRequest.__post_init__

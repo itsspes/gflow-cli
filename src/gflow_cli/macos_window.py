@@ -31,6 +31,7 @@ log = structlog.get_logger(__name__)
 
 _OSASCRIPT_BIN = "/usr/bin/osascript"
 _OSASCRIPT_TIMEOUT_S = 1.5
+_WATCH_POLL_INTERVAL_S = 0.1
 # Strict allowlist for macOS process names interpolated into AppleScript.
 _SAFE_APP_NAME_RE = re.compile(r"^[A-Za-z0-9 ._+-]{1,128}$")
 _CHROME_PROCESS_NAMES: tuple[str, ...] = (
@@ -91,6 +92,18 @@ def capture_frontmost_app() -> str | None:
     return app_name
 
 
+def hide_chrome_processes() -> bool:
+    """Hide any visible Chrome/Chromium processes on macOS. Best-effort; never raises."""
+    if sys.platform != "darwin":
+        return False
+    lines = ['tell application "System Events"']
+    for proc in _CHROME_PROCESS_NAMES:
+        lines.append(f'  if exists process "{proc}" then set visible of process "{proc}" to false')
+    lines.append("end tell")
+    lines.append('return "ok"')
+    return _run_osascript("\n".join(lines)) == "ok"
+
+
 def background_chrome_and_restore_focus(previous_app: str | None) -> bool:
     """Hide headed Chrome processes and restore focus to ``previous_app`` on macOS.
 
@@ -114,13 +127,28 @@ def background_chrome_and_restore_focus(previous_app: str | None) -> bool:
     return ok
 
 
+async def _watch_and_hide_chrome(
+    stop_event: asyncio.Event,
+    *,
+    interval: float = _WATCH_POLL_INTERVAL_S,
+) -> None:
+    """Poll and hide Chrome windows while Playwright spawns a headed context."""
+    while not stop_event.is_set():
+        await asyncio.to_thread(hide_chrome_processes)
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=interval)
+        except TimeoutError:
+            continue
+
+
 @asynccontextmanager
 async def macos_background_launch_guard(
     *,
     headless: bool,
     enabled: bool,
+    poll_interval: float = _WATCH_POLL_INTERVAL_S,
 ) -> AsyncGenerator[None]:
-    """Capture frontmost app before launch and restore focus immediately after.
+    """Capture frontmost app, suppress launch flash concurrently, and restore focus.
 
     Intended to wrap ``launch_persistent_context(...)`` for non-login headed
     generation launches. No-op off macOS, when headless, in CI/pytest, or when
@@ -130,5 +158,15 @@ async def macos_background_launch_guard(
         yield
         return
     previous_app = await asyncio.to_thread(capture_frontmost_app)
-    yield
+    stop_event = asyncio.Event()
+    watcher = asyncio.create_task(_watch_and_hide_chrome(stop_event, interval=poll_interval))
+    try:
+        yield
+    finally:
+        stop_event.set()
+        watcher.cancel()
+        try:
+            await watcher
+        except asyncio.CancelledError:
+            pass
     await asyncio.to_thread(background_chrome_and_restore_focus, previous_app)

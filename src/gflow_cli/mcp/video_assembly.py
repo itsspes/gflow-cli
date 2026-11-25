@@ -32,9 +32,10 @@ def _guarded(fn: Any) -> Any:
     name="gflow_video_assemble",
     description=(
         "Join local video files or locally available catalog video IDs with optional music "
-        "and voiceover. Ducking lowers music and clip audio under voiceover by default. This "
-        "is local, credit-free processing; out_file must be inside the configured output "
-        "directory. Geometry and frame rate follow the first clip."
+        "and voiceover. Ducking applies gentle 4:1 sidechain compression and vocal-pocket EQ "
+        "on music under voiceover by default; optional master_lufs runs 2-pass EBU R128 "
+        "loudness mastering. This is local, credit-free processing; out_file must be inside "
+        "the configured output directory. Geometry and frame rate follow the first clip."
     ),
 )
 @_guarded
@@ -48,6 +49,7 @@ async def gflow_video_assemble(
     voiceover_volume: float = 1.0,
     duck: bool = True,
     strip_veo_audio: bool = False,
+    master_lufs: float | None = None,
     profile: str | None = None,
 ) -> dict[str, Any]:
     """Join local clips without Flow calls or credits.
@@ -60,8 +62,9 @@ async def gflow_video_assemble(
         clip_volume: Clip audio gain, from 0 to 1 (default 1).
         music_volume: Music gain, from 0 to 1 (default 0.3).
         voiceover_volume: Voiceover gain, from 0 to 1 (default 1).
-        duck: Reduce music and clip audio while voiceover is present (default true).
+        duck: Reduce music (with vocal-pocket EQ) and clip audio under voiceover (default true).
         strip_veo_audio: Strip audio from input clips (default false).
+        master_lufs: Optional target integrated loudness in LUFS (e.g. -14.0) for 2-pass mastering.
         profile: Optional catalog profile to disambiguate media IDs.
     """
     from gflow_cli.mcp.tools import (
@@ -89,6 +92,7 @@ async def gflow_video_assemble(
             voiceover_volume=voiceover_volume,
             duck=duck,
             strip_clip_audio=strip_veo_audio,
+            master_lufs=master_lufs,
         )
 
     result = await asyncio.to_thread(assemble)

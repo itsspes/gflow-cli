@@ -19,6 +19,13 @@ from gflow_cli.api.video import is_media_uuid
 from gflow_cli.data.models import AssetKind
 from gflow_cli.data.repository import verified_local_path
 from gflow_cli.errors import DataStoreError, VideoAssemblyError
+from gflow_cli.services.audio_mastering import (
+    DEFAULT_DUCKING_RATIO,
+    DEFAULT_TRUE_PEAK_DB,
+    build_ducking_filter,
+    normalize_video_audio_track,
+    vocal_pocket_eq_specs,
+)
 from gflow_cli.services.media_recovery import resolve_asset
 
 _log = structlog.get_logger(__name__)
@@ -26,7 +33,7 @@ _log = structlog.get_logger(__name__)
 _SAMPLE_RATE = 44100
 _CHANNELS = 2
 _CHUNK = 1024
-_DUCKING = "threshold=0.01:ratio=10:attack=5:release=400"
+_DUCKING = build_ducking_filter()
 # A live reservation lasts only for one os.replace; older empty files are abandoned.
 _STALE_RESERVATION_S = 60.0
 
@@ -46,6 +53,11 @@ class AssemblyResult:
     video_encoder: str = "libx264"
     clip_audio_stripped: bool = False
     has_audio_stream: bool = True
+    vocal_pocket_eq_applied: bool = False
+    ducking_ratio: float | None = None
+    master_lufs_target: float | None = None
+    measured_lufs: float | None = None
+    measured_true_peak_db: float | None = None
 
 
 @dataclass(frozen=True)
@@ -76,7 +88,7 @@ def assembly_result_payload(result: AssemblyResult) -> dict[str, Any]:
         if result.has_audio_stream
         else None
     )
-    return {
+    payload: dict[str, Any] = {
         "status": "succeeded",
         "output_file": str(result.output_file),
         "duration_seconds": result.duration_seconds,
@@ -84,6 +96,8 @@ def assembly_result_payload(result: AssemblyResult) -> dict[str, Any]:
         "has_music": result.has_music,
         "has_voiceover": result.has_voiceover,
         "ducking_applied": result.ducking_applied,
+        "ducking_ratio": result.ducking_ratio,
+        "vocal_pocket_eq_applied": result.vocal_pocket_eq_applied,
         "clip_audio_stripped": result.clip_audio_stripped,
         "video_stream": {
             "codec": "h264",
@@ -95,6 +109,17 @@ def assembly_result_payload(result: AssemblyResult) -> dict[str, Any]:
         "audio_stream": audio_stream,
         "bytes": result.bytes,
     }
+    if result.master_lufs_target is not None:
+        payload["master_lufs_target"] = round(result.master_lufs_target, 2)
+        payload["measured_lufs"] = (
+            round(result.measured_lufs, 2) if result.measured_lufs is not None else None
+        )
+        payload["measured_true_peak_db"] = (
+            round(result.measured_true_peak_db, 2)
+            if result.measured_true_peak_db is not None
+            else None
+        )
+    return payload
 
 
 def resolve_assembly_input(value: str, *, profile: str | None = None) -> Path:
@@ -356,6 +381,16 @@ def _split_voice(graph: Any, voice_in: Any, voiceover_volume: float) -> Any:
     return split
 
 
+def _chain_vocal_pocket_eq(graph: Any, source_node: Any) -> Any:
+    """Apply gentle 300 Hz–3 kHz vocal-pocket EQ carving to a music bed node."""
+    current = source_node
+    for filter_name, filter_args in vocal_pocket_eq_specs():
+        eq_node = graph.add(filter_name, filter_args)
+        current.link_to(eq_node)
+        current = eq_node
+    return current
+
+
 def _audio_graph(
     av: Any,
     *,
@@ -366,7 +401,7 @@ def _audio_graph(
     music: Path | None,
     voiceover: Path | None,
 ) -> tuple[Any, list[Any], Any]:
-    """Build the gain, optional sidechain and limited mix for available tracks."""
+    """Build the gain, optional vocal-pocket EQ + 4:1 sidechain, and limited mix."""
     graph = av.filter.Graph()
     clip_in = graph.add_abuffer(
         sample_rate=_SAMPLE_RATE, format="flt", layout="stereo", time_base="1/44100"
@@ -389,8 +424,9 @@ def _audio_graph(
             )
             inputs.append(voice_in)
             split = _split_voice(graph, voice_in, voiceover_volume)
+            music_eq = _chain_vocal_pocket_eq(graph, music_vol)
             compressor = graph.add("sidechaincompress", _DUCKING)
-            music_vol.link_to(compressor, 0, 0)
+            music_eq.link_to(compressor, 0, 0)
             split.link_to(compressor, 0, 1)
             tracks.extend([(compressor, 0), (split, 1)])
         else:
@@ -854,6 +890,7 @@ def assemble_videos(
     duck: bool = True,
     strip_clip_audio: bool = False,
     prefer_hardware_encoder: bool | None = None,
+    master_lufs: float | None = None,
 ) -> AssemblyResult:
     """Join clips, normalize to the first clip, and mix optional audio locally."""
     try:
@@ -868,6 +905,12 @@ def assemble_videos(
 
     _av: Any = av
     _validate_assembly(clips, output, music, voiceover, clip_volume, music_volume, voiceover_volume)
+    if master_lufs is not None and not (-70.0 <= master_lufs <= -5.0):
+        raise VideoAssemblyError(
+            detail="master_lufs must be between -70.0 and -5.0 LUFS.",
+            route="video.assemble",
+            charged="no",
+        )
     prefer_hw = (
         get_settings().video_hw_accel
         if prefer_hardware_encoder is None
@@ -877,6 +920,9 @@ def assemble_videos(
     include_audio = not (strip_clip_audio and music is None and voiceover is None)
     audio_spools: list[Path] = []
     temp_output: Path | None = None
+    mastered_output: Path | None = None
+    measured_lufs: float | None = None
+    measured_true_peak_db: float | None = None
     try:
         layout = _inspect_videos(clips, _av)
         if include_audio:
@@ -932,14 +978,30 @@ def assemble_videos(
                 encoder=encoder,
                 include_audio=include_audio,
             )
-        publish_output(temp_output, output)
+        publish_source = temp_output
+        if master_lufs is not None and include_audio:
+            m_fd, m_name = tempfile.mkstemp(
+                prefix=f".{output.stem}.master.", suffix=output.suffix, dir=output.parent
+            )
+            os.close(m_fd)
+            mastered_output = Path(m_name)
+            measured_lufs, measured_true_peak_db, _ = normalize_video_audio_track(
+                temp_output,
+                mastered_output,
+                target_lufs=master_lufs,
+                true_peak=DEFAULT_TRUE_PEAK_DB,
+                sample_rate=_SAMPLE_RATE,
+            )
+            publish_source = mastered_output
+        publish_output(publish_source, output)
+        duck_active = duck and voiceover is not None
         return AssemblyResult(
             output_file=output,
             duration_seconds=layout.total_frames / layout.frame_rate,
             clips_count=len(clips),
             has_music=music is not None,
             has_voiceover=voiceover is not None,
-            ducking_applied=duck and voiceover is not None,
+            ducking_applied=duck_active,
             width=layout.size[0],
             height=layout.size[1],
             frame_rate=layout.frame_rate,
@@ -947,21 +1009,27 @@ def assemble_videos(
             video_encoder=encoder,
             clip_audio_stripped=strip_clip_audio,
             has_audio_stream=include_audio,
+            vocal_pocket_eq_applied=duck_active and music is not None,
+            ducking_ratio=DEFAULT_DUCKING_RATIO if duck_active else None,
+            master_lufs_target=master_lufs if include_audio else None,
+            measured_lufs=measured_lufs,
+            measured_true_peak_db=measured_true_peak_db,
         )
     except VideoAssemblyError:
         raise
     except (_av.error.FFmpegError, OSError, ValueError) as exc:
         raise VideoAssemblyError(detail=str(exc), route="video.assemble") from exc
     finally:
-        if temp_output is not None:
-            try:
-                temp_output.unlink(missing_ok=True)
-            except OSError as exc:
-                _log.warning(
-                    "could_not_remove_temp_output",
-                    path=str(temp_output),
-                    error=str(exc),
-                )
+        for candidate in (temp_output, mastered_output):
+            if candidate is not None:
+                try:
+                    candidate.unlink(missing_ok=True)
+                except OSError as exc:
+                    _log.warning(
+                        "could_not_remove_temp_output",
+                        path=str(candidate),
+                        error=str(exc),
+                    )
         for spool in audio_spools:
             try:
                 spool.unlink(missing_ok=True)

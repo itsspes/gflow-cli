@@ -33,6 +33,7 @@ from gflow_cli.cli_cancel import cancel as _cancel_command
 from gflow_cli.cli_capabilities import capabilities as _capabilities_command
 from gflow_cli.cli_character import character as _character_group
 from gflow_cli.cli_credits import credits as _credits_group
+from gflow_cli.cli_daemon import daemon as _daemon_group
 from gflow_cli.cli_data import data as _data_group
 from gflow_cli.cli_docs import docs as _docs_command
 from gflow_cli.cli_doctor import doctor as _doctor_command
@@ -44,12 +45,14 @@ from gflow_cli.cli_media import media as _media_group
 from gflow_cli.cli_models import models as _models_command
 from gflow_cli.cli_movie import movie as _movie_group
 from gflow_cli.cli_project import project as _project_group
+from gflow_cli.cli_qa import qa as _qa_group
 from gflow_cli.cli_run import run as _run_command
 from gflow_cli.cli_scene import scene as _scene_group
 from gflow_cli.cli_telemetry import telemetry as _telemetry_group
 from gflow_cli.cli_tools import tools as _tools_group
 from gflow_cli.cli_update import update as _update_command
 from gflow_cli.cli_video import video as _video_group
+from gflow_cli.cli_workspace import workspace as _workspace_group
 from gflow_cli.config import get_settings, warn_if_removed_gemini_key_set
 from gflow_cli.observability import DEBUG_LEVEL, configure_logging
 from gflow_cli.update_check import UpdateNotice, maybe_notify_update
@@ -738,6 +741,9 @@ main.add_command(_models_command)
 main.add_command(_scene_group)
 main.add_command(_telemetry_group)
 main.add_command(_tools_group)
+main.add_command(_daemon_group)
+main.add_command(_workspace_group)
+main.add_command(_qa_group)
 
 
 # --- mcp --------------------------------------------------------------------
