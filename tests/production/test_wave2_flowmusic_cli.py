@@ -722,3 +722,219 @@ def test_mcp_music_tools_respect_no_spend_policy(monkeypatch: pytest.MonkeyPatch
         for name, tool in saved.items():
             if tool is not None and mgr.get_tool(name) is None:
                 mgr._tools[name] = tool  # pyright: ignore[reportPrivateUsage]
+
+
+# ---------------------------------------------------------------------------
+# 6. Native Advanced Controls, Project Auto-Naming, Model No-Op & Fast-Fail
+# ---------------------------------------------------------------------------
+
+
+def test_format_flowmusic_length_parsing_clamping_and_validation() -> None:
+    fmt = fm_client_mod.format_flowmusic_length
+    assert fmt(90) == "1:30"
+    assert fmt(60) == "1:00"
+    assert fmt(30) == "1:00"  # clamped to FlowMusic 1:00 minimum
+    assert fmt("0:30") == "1:00"
+    assert fmt("1:30") == "1:30"
+    assert fmt("2:05") == "2:05"
+    for bad in ("", "0", "-10", "abc", "1:99"):
+        with pytest.raises(ValueError):
+            fmt(bad)
+
+
+def test_derive_project_music_titles_with_and_without_project(tmp_path: Path) -> None:
+    # Backward-compatible when no project_dir and no explicit titles
+    assert fm_service.derive_project_music_titles(None) == (None, None)
+    assert fm_service.derive_project_music_titles(None, title="Solo Track") == (
+        "Solo Track",
+        "Solo Track",
+    )
+
+    # Workspace slug alignment
+    runner = CliRunner()
+    init_res = runner.invoke(
+        main, ["workspace", "init", "coffee-spot", "--root", str(tmp_path), "--json"]
+    )
+    assert init_res.exit_code == 0, init_res.output
+    project_dir = Path(json.loads(init_res.output)["project_dir"])
+
+    assert fm_service.derive_project_music_titles(project_dir, shot="s02") == (
+        "coffee-spot s02",
+        "coffee-spot",
+    )
+    assert fm_service.derive_project_music_titles(
+        project_dir, shot="s02", title="Custom Cue", session_title="Campaign A"
+    ) == ("Custom Cue", "Campaign A")
+
+
+async def test_client_compose_advanced_controls_title_session_rename_and_model_noop(
+    tmp_path: Path,
+) -> None:
+    wav_bytes = _synthetic_wav_bytes(duration_sec=2.0)
+    clip_calls = 0
+
+    def _clips_poll() -> dict[str, Any]:
+        nonlocal clip_calls
+        clip_calls += 1
+        if clip_calls == 1:
+            return {"clips": []}
+        return {
+            "clips": [
+                {
+                    "id": "adv-clip-1",
+                    "title": "Coffee Spot s01",
+                    "wav_url": "https://cdn.example/adv-clip-1.wav",
+                    "duration": 2.0,
+                }
+            ]
+        }
+
+    recorded: dict[str, Any] = {}
+    rename_calls: list[tuple[str, str]] = []
+
+    class _BlurLocator(_FakeLocator):
+        async def blur(self) -> None:
+            recorded.setdefault("blurs", []).append(self._name)
+
+    page = _FakePage(
+        url=FLOWMUSIC_SESSION_URL,
+        locators={
+            SETTINGS_MENU_SELECTOR: _FakeLocator(visible=True, text="Creator"),
+            SOUND_DESC_SELECTOR: _FakeLocator(visible=True, recorded=recorded, name="sound"),
+            fm_client_mod.ADVANCED_SOUND_SWITCH_SELECTOR: _FakeLocator(
+                visible=True, checked=False, recorded=recorded, name="advanced_switch"
+            ),
+            fm_client_mod.BPM_INPUT_SELECTOR: _BlurLocator(
+                visible=True, recorded=recorded, name="bpm"
+            ),
+            fm_client_mod.LENGTH_INPUT_SELECTOR: _BlurLocator(
+                visible=True, recorded=recorded, name="length"
+            ),
+            fm_client_mod.SEED_INPUT_SELECTOR: _BlurLocator(
+                visible=True, recorded=recorded, name="seed"
+            ),
+            fm_client_mod.MODEL_TRIGGER_SELECTOR: _FakeLocator(
+                visible=True,
+                text="Lyria 3.5 Pro",
+                recorded=recorded,
+                name="model_trigger",
+            ),
+            fm_client_mod.EXPAND_DETAILS_SELECTOR: _FakeLocator(
+                visible=True, recorded=recorded, name="expand_details"
+            ),
+            fm_client_mod.TITLE_TEXTAREA_SELECTOR: _FakeLocator(
+                visible=True, recorded=recorded, name="title"
+            ),
+        },
+        api_responses={"/__api/clips/auth-user": _clips_poll},
+        download_bytes={"https://cdn.example/adv-clip-1.wav": (wav_bytes, "audio/wav")},
+    )
+
+    class _GenerateBtn(_FakeLocator):
+        async def click(self) -> None:
+            await super().click()
+            page.url = "https://www.flowmusic.app/session/sess_adv_999"
+
+    page._locators[fm_client_mod.GENERATE_BUTTON_SELECTOR] = _GenerateBtn(
+        visible=True, recorded=recorded, name="generate"
+    )
+    page.recorded = recorded
+    client = _attached_client(tmp_path, page)
+
+    async def _fake_rename(session_id: str, title: str) -> bool:
+        rename_calls.append((session_id, title))
+        return True
+
+    client.rename_session = _fake_rename  # type: ignore[method-assign]
+
+    payload, session_id = await client.compose(
+        "120 BPM crisp espresso promo",
+        model="Lyria 3.5 Pro",
+        bpm=120,
+        length="30",
+        seed="42",
+        title="Coffee Spot s01",
+        session_title="coffee-spot",
+        timeout_seconds=10.0,
+    )
+    assert payload.clip is not None and payload.clip.id == "adv-clip-1"
+    assert session_id == "sess_adv_999"
+    # Advanced switch auto-enabled
+    assert "advanced_switch" in recorded["clicks"]
+    # Model already selected -> MUST NOT click model_trigger
+    assert "model_trigger" not in recorded["clicks"]
+    # Native BPM, clamped Length (1:00), Seed, and expanded Details Title filled
+    assert recorded["fills"]["bpm"] == "120"
+    assert recorded["fills"]["length"] == "1:00"
+    assert recorded["fills"]["seed"] == "42"
+    assert "expand_details" in recorded["clicks"]
+    assert recorded["fills"]["title"] == "Coffee Spot s01"
+    # Session automatically renamed once
+    assert rename_calls == [("sess_adv_999", "coffee-spot")]
+
+
+async def test_client_fast_fail_on_api_error_and_ui_toast(tmp_path: Path) -> None:
+    # 1. API >= 400 error on /__api/producer/ raises FlowMusicError immediately
+    page_api = _FakePage(
+        url=FLOWMUSIC_SESSION_URL,
+        api_responses={"/__api/clips/auth-user": {"clips": []}},
+    )
+    client_api = _attached_client(tmp_path, page_api)
+    client_api._api_errors.append(
+        {"status": 500, "path": "/__api/producer/generate", "detail": "internal error"}
+    )
+    with pytest.raises(fm_client_mod.FlowMusicError, match="500"):
+        await client_api._wait_for_new_clip(  # pyright: ignore[reportPrivateUsage]
+            existing_ids=set(), preferred_format="wav", timeout_seconds=30.0
+        )
+
+    # 2. UI error toast ("Something went wrong") raises FlowMusicError immediately
+    class _ToastErrorPage(_FakePage):
+        async def evaluate(self, js: str, arg: Any = None) -> Any:
+            if "something went wrong" in js.lower():
+                return "Something went wrong. Please try again."
+            return await super().evaluate(js, arg)
+
+    page_ui = _ToastErrorPage(
+        url=FLOWMUSIC_SESSION_URL,
+        api_responses={"/__api/clips/auth-user": {"clips": []}},
+    )
+    client_ui = _attached_client(tmp_path, page_ui)
+    with pytest.raises(fm_client_mod.FlowMusicError, match="Something went wrong"):
+        await client_ui._wait_for_new_clip(  # pyright: ignore[reportPrivateUsage]
+            existing_ids=set(), preferred_format="wav", timeout_seconds=30.0
+        )
+
+
+def test_cli_music_rename_session_and_advanced_flags(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from gflow_cli import cli_music
+
+    runner = CliRunner()
+    help_res = runner.invoke(main, ["music", "compose", "--help"])
+    assert help_res.exit_code == 0, help_res.output
+    for flag in ("--bpm", "--length", "--seed", "--title", "--session-title"):
+        assert flag in help_res.output
+
+    monkeypatch.setattr(cli_music, "_profile_dir", lambda _p: tmp_path / "prof")
+
+    async def _fake_rename(
+        _prof: Path, session_id: str, title: str, **_kw: Any
+    ) -> dict[str, Any]:
+        return {
+            "status": "renamed",
+            "renamed": True,
+            "session_id": session_id,
+            "title": title,
+        }
+
+    monkeypatch.setattr(cli_music, "rename_flowmusic_session", _fake_rename)
+    res = runner.invoke(
+        main, ["music", "rename-session", "sess-123", "Espresso Promo", "--json"]
+    )
+    assert res.exit_code == 0, res.output
+    data = json.loads(res.output)
+    assert data["renamed"] is True
+    assert data["session_id"] == "sess-123"
+    assert data["title"] == "Espresso Promo"

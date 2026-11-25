@@ -493,3 +493,35 @@ def test_qa_check_audio_integrates_with_audio_analysis(tmp_path: Path) -> None:
     assert data["kind"] == "audio"
     assert data["verdict"] in {"PASS_TECH", "NEEDS_MINOR_EDIT"}
     assert "integrated_lufs" in data["metrics"] or "lufs_integrated" in data["metrics"]
+
+
+def test_qa_check_video_expect_audio_suppresses_room_tone_and_warns_when_silent(
+    assembly_media: dict[str, Path], tmp_path: Path
+) -> None:
+    runner = CliRunner()
+
+    # 1. Mastered video WITH audio + --expect-audio -> NO has_unstripped_audio warning
+    r_ok = runner.invoke(
+        main, ["video", "qa", str(assembly_media["clip"]), "--expect-audio", "--json"]
+    )
+    assert r_ok.exit_code == 0, r_ok.output
+    d_ok = json.loads(r_ok.output)
+    assert d_ok["metrics"]["expect_audio"] is True
+    assert d_ok["metrics"]["has_unstripped_audio"] is False
+    assert not any(i["code"] == "has_unstripped_audio" for i in d_ok["issues"])
+    assert not any(i["code"] == "missing_expected_audio" for i in d_ok["issues"])
+
+    # 2. Silent/stripped video WITHOUT audio + --expect-audio -> missing_expected_audio warn
+    silent_mp4 = tmp_path / "silent_master.mp4"
+    assemble_videos(
+        [assembly_media["clip"]],
+        silent_mp4,
+        strip_clip_audio=True,
+        prefer_hardware_encoder=False,
+    )
+    r_warn = runner.invoke(main, ["qa", "check", str(silent_mp4), "--expect-audio", "--json"])
+    assert r_warn.exit_code == 0, r_warn.output
+    d_warn = json.loads(r_warn.output)
+    assert d_warn["metrics"]["expect_audio"] is True
+    assert d_warn["verdict"] == "NEEDS_MINOR_EDIT"
+    assert any(i["code"] == "missing_expected_audio" for i in d_warn["issues"])
